@@ -1,0 +1,5 @@
+# The default MacOSX27.0 SDK on this machine ships .tbd stubs that the
+# installed `ld` cannot parse (tapi "unknown architecture arm64e.x1").
+# Pin an SDK the linker understands so `cargo build` works out of the box.
+[env]
+SDKROOT = "/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk"
