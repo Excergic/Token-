@@ -1,30 +1,23 @@
-use std::fmt;
+use crate::llm::{LlmClient, LlmError};
 
-/// Errors the runtime can produce. Will grow once an LLM is wired in.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
+    #[error("task is empty")]
     EmptyTask,
+    #[error(transparent)]
+    Llm(#[from] LlmError),
 }
-
-impl fmt::Display for RuntimeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            RuntimeError::EmptyTask => write!(f, "task is empty"),
-        }
-    }
-}
-
-impl std::error::Error for RuntimeError {}
 
 /// The agent runtime: takes a task, returns a response.
-/// Currently a stub; the LLM and tool loop will live here.
+/// Today it forwards the task to the LLM once. Tools and the agent loop
+/// will live here.
 pub struct AgentRuntime {
-    // model client, tools, config, ...
+    llm: LlmClient,
 }
 
 impl AgentRuntime {
-    pub fn new() -> Self {
-        Self {}
+    pub fn new(llm: LlmClient) -> Self {
+        Self { llm }
     }
 
     pub fn run(&self, task: &str) -> Result<String, RuntimeError> {
@@ -32,12 +25,6 @@ impl AgentRuntime {
         if task.is_empty() {
             return Err(RuntimeError::EmptyTask);
         }
-        Ok(format!("Agent received: {task}"))
-    }
-}
-
-impl Default for AgentRuntime {
-    fn default() -> Self {
-        Self::new()
+        Ok(self.llm.complete(task)?)
     }
 }
