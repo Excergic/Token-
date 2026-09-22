@@ -7,9 +7,17 @@
 
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::time::Duration;
 
 use crate::conversation::{Message, ToolCall};
+
+/// What the model returned, plus why it stopped. `finish_reason` is the only
+/// way to tell a finished answer from one truncated by `max_tokens`.
+pub struct Completion {
+    pub message: Message,
+    pub finish_reason: String,
+}
 
 pub const DEFAULT_BASE_URL: &str = "https://api.sarvam.ai";
 pub const DEFAULT_MODEL: &str = "sarvam-105b";
@@ -50,11 +58,13 @@ impl LlmClient {
         }
     }
 
-    /// Send the whole conversation and return the assistant's next message.
-    pub fn chat(&self, messages: &[Message]) -> Result<Message, LlmError> {
+    /// Send the whole conversation plus the tools the model may call, and
+    /// return the assistant's next message.
+    pub fn chat(&self, messages: &[Message], tools: &[Value]) -> Result<Completion, LlmError> {
         let request = ChatRequest {
             model: &self.model,
             messages: messages.iter().map(WireMessage::from).collect(),
+            tools: (!tools.is_empty()).then_some(tools),
         };
 
         let response = self
@@ -80,7 +90,10 @@ impl LlmClient {
             .choices
             .into_iter()
             .next()
-            .map(|choice| choice.message.into())
+            .map(|choice| Completion {
+                message: choice.message.into(),
+                finish_reason: choice.finish_reason,
+            })
             .ok_or(LlmError::EmptyResponse)
     }
 }
@@ -92,6 +105,8 @@ impl LlmClient {
 struct ChatRequest<'a> {
     model: &'a str,
     messages: Vec<WireMessage<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<&'a [Value]>,
 }
 
 #[derive(Serialize)]
@@ -179,6 +194,8 @@ struct ChatResponse {
 #[derive(Deserialize)]
 struct Choice {
     message: ResponseMessage,
+    #[serde(default)]
+    finish_reason: String,
 }
 
 #[derive(Deserialize)]

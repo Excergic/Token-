@@ -2,6 +2,7 @@ mod cli;
 mod conversation;
 mod llm;
 mod runtime;
+mod tools;
 
 use clap::Parser;
 use std::process;
@@ -17,7 +18,8 @@ fn main() {
 
     let cli = Cli::parse();
     let llm = LlmClient::new(&cli.api_key, &cli.model);
-    let runtime = AgentRuntime::new(llm);
+    let root = std::env::current_dir().expect("current directory is readable");
+    let runtime = AgentRuntime::new(llm, root);
 
     match runtime.run(&cli.task()) {
         Ok(response) => println!("{response}"),
