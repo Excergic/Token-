@@ -40,6 +40,20 @@ impl Conversation {
         Self::default()
     }
 
+    /// Rebuild a transcript restored from a session. Ordinary messages: this
+    /// module still knows nothing about where they were kept.
+    pub fn from_messages(messages: Vec<Message>) -> Self {
+        Self { messages }
+    }
+
+    pub fn len(&self) -> usize {
+        self.messages.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+
     pub fn push(&mut self, message: Message) {
         self.messages.push(message);
     }

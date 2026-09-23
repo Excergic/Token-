@@ -1,91 +1,41 @@
-//! LlmClient: stateless. Takes the conversation so far, returns the model's
-//! next message. No tools are advertised, no loop, no streaming.
+//! The OpenAI-shaped chat completions wire: `POST /v1/chat/completions`.
 //!
-//! Talks to the Sarvam AI chat completions API:
-//! `POST https://api.sarvam.ai/v1/chat/completions`, auth via the
-//! `api-subscription-key` header, OpenAI-shaped request and response bodies.
+//! Sarvam speaks this, as does any OpenAI-compatible endpoint. One flat
+//! assistant message carries content and tool calls as sibling fields, so the
+//! order between them is not expressible; that is the format's limit, not ours.
 
-use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::time::Duration;
+use serde_json::{Value, json};
 
+use super::{Completion, LlmError, Transport};
 use crate::conversation::{Message, ToolCall};
+use crate::tools::ToolSpec;
 
-/// What the model returned, plus why it stopped. `finish_reason` is the only
-/// way to tell a finished answer from one truncated by `max_tokens`.
-pub struct Completion {
-    pub message: Message,
-    pub finish_reason: String,
-}
+pub(super) struct ChatCompletions;
 
-pub const DEFAULT_BASE_URL: &str = "https://api.sarvam.ai";
-pub const DEFAULT_MODEL: &str = "sarvam-105b";
-
-#[derive(Debug, thiserror::Error)]
-pub enum LlmError {
-    #[error("http request failed: {0}")]
-    Http(#[from] reqwest::Error),
-    #[error("api returned {status}: {body}")]
-    Api { status: u16, body: String },
-    #[error("could not decode api response: {source}; body: {body}")]
-    Decode {
-        source: serde_json::Error,
-        body: String,
-    },
-    #[error("api returned no choices")]
-    EmptyResponse,
-}
-
-pub struct LlmClient {
-    http: Client,
-    base_url: String,
-    api_key: String,
-    model: String,
-}
-
-impl LlmClient {
-    pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
-        let http = Client::builder()
-            .timeout(Duration::from_secs(60))
-            .build()
-            .expect("reqwest client with static config");
-        Self {
-            http,
-            base_url: DEFAULT_BASE_URL.to_string(),
-            api_key: api_key.into(),
-            model: model.into(),
-        }
+impl Transport for ChatCompletions {
+    fn path(&self) -> &'static str {
+        "/v1/chat/completions"
     }
 
-    /// Send the whole conversation plus the tools the model may call, and
-    /// return the assistant's next message.
-    pub fn chat(&self, messages: &[Message], tools: &[Value]) -> Result<Completion, LlmError> {
-        let request = ChatRequest {
-            model: &self.model,
-            messages: messages.iter().map(WireMessage::from).collect(),
-            tools: (!tools.is_empty()).then_some(tools),
-        };
-
-        let response = self
-            .http
-            .post(format!("{}/v1/chat/completions", self.base_url))
-            .header("api-subscription-key", &self.api_key)
-            .json(&request)
-            .send()?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().unwrap_or_default();
-            return Err(LlmError::Api {
-                status: status.as_u16(),
-                body,
-            });
+    fn request(&self, model: &str, messages: &[Message], tools: &[ToolSpec]) -> Value {
+        let wire: Vec<WireMessage> = messages.iter().map(WireMessage::from).collect();
+        let mut body = json!({
+            "model": model,
+            "messages": wire,
+        });
+        if !tools.is_empty() {
+            body["tools"] = tools.iter().map(tool_json).collect();
         }
+        body
+    }
 
-        let body = response.text()?;
+    fn normalize(&self, body: &str) -> Result<Completion, LlmError> {
         let parsed: ChatResponse =
-            serde_json::from_str(&body).map_err(|source| LlmError::Decode { source, body })?;
+            serde_json::from_str(body).map_err(|source| LlmError::Decode {
+                source,
+                body: body.to_string(),
+            })?;
         parsed
             .choices
             .into_iter()
@@ -98,16 +48,20 @@ impl LlmClient {
     }
 }
 
-// Wire types. Kept private: nothing outside this module should know the
-// provider's JSON shape.
-
-#[derive(Serialize)]
-struct ChatRequest<'a> {
-    model: &'a str,
-    messages: Vec<WireMessage<'a>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<&'a [Value]>,
+/// This wire nests the function under a `function` key. The Responses wire
+/// does not; that difference is the whole reason `ToolSpec` is neutral.
+fn tool_json(spec: &ToolSpec) -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": spec.name,
+            "description": spec.description,
+            "parameters": spec.parameters,
+        }
+    })
 }
+
+// Wire types. Kept private: nothing outside this module should know the shape.
 
 #[derive(Serialize)]
 struct WireMessage<'a> {
@@ -238,7 +192,14 @@ impl From<ResponseMessage> for Message {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+
+    fn spec() -> ToolSpec {
+        ToolSpec {
+            name: "read_file",
+            description: "Read a file.",
+            parameters: json!({"type": "object", "properties": {}}),
+        }
+    }
 
     #[test]
     fn serialises_every_message_variant() {
@@ -262,21 +223,36 @@ mod tests {
                 tool_calls: vec![],
             },
         ];
-        let wire: Vec<WireMessage> = messages.iter().map(WireMessage::from).collect();
-        let actual = serde_json::to_value(&wire).unwrap();
+        let actual = ChatCompletions.request("sarvam-105b", &messages, &[]);
 
-        let expected = json!([
-            {"role": "system", "content": "be brief"},
-            {"role": "user", "content": "hi"},
-            {"role": "assistant", "tool_calls": [{
-                "id": "call-1",
-                "type": "function",
-                "function": {"name": "read_file", "arguments": "{\"path\":\"src/main.rs\"}"}
-            }]},
-            {"role": "tool", "content": "fn main() {}", "tool_call_id": "call-1"},
-            {"role": "assistant", "content": "done"},
-        ]);
+        let expected = json!({
+            "model": "sarvam-105b",
+            "messages": [
+                {"role": "system", "content": "be brief"},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":\"src/main.rs\"}"}
+                }]},
+                {"role": "tool", "content": "fn main() {}", "tool_call_id": "call-1"},
+                {"role": "assistant", "content": "done"},
+            ]
+        });
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn nests_the_tool_spec_under_function() {
+        let body = ChatCompletions.request("sarvam-105b", &[], &[spec()]);
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tools"][0]["function"]["name"], "read_file");
+    }
+
+    #[test]
+    fn omits_tools_when_there_are_none() {
+        let body = ChatCompletions.request("sarvam-105b", &[], &[]);
+        assert!(body.get("tools").is_none());
     }
 
     #[test]
@@ -287,11 +263,12 @@ mod tests {
                 "index": 0,
                 "message": {"role": "assistant", "content": "hello", "tool_calls": null}
             }]
-        });
-        let parsed: ChatResponse = serde_json::from_value(body).unwrap();
-        let message: Message = parsed.choices.into_iter().next().unwrap().message.into();
+        })
+        .to_string();
+        let completion = ChatCompletions.normalize(&body).unwrap();
+        assert_eq!(completion.finish_reason, "stop");
         assert_eq!(
-            message,
+            completion.message,
             Message::Assistant {
                 content: Some("hello".into()),
                 tool_calls: vec![],
@@ -315,11 +292,11 @@ mod tests {
                     }]
                 }
             }]
-        });
-        let parsed: ChatResponse = serde_json::from_value(body).unwrap();
-        let message: Message = parsed.choices.into_iter().next().unwrap().message.into();
+        })
+        .to_string();
+        let completion = ChatCompletions.normalize(&body).unwrap();
         assert_eq!(
-            message,
+            completion.message,
             Message::Assistant {
                 content: None,
                 tool_calls: vec![ToolCall {
@@ -329,5 +306,14 @@ mod tests {
                 }],
             }
         );
+    }
+
+    #[test]
+    fn reports_a_response_with_no_choices() {
+        let body = json!({"choices": []}).to_string();
+        assert!(matches!(
+            ChatCompletions.normalize(&body),
+            Err(LlmError::EmptyResponse)
+        ));
     }
 }
