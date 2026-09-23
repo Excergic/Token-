@@ -116,6 +116,46 @@ pub fn committed_secret(content: &str) -> Option<String> {
     None
 }
 
+/// Substrings that mark an environment variable as carrying a credential.
+/// Matched case-insensitively against the name, so `SARVAM_API_KEY`,
+/// `GITHUB_TOKEN` and `aws_secret_access_key` all go.
+const SECRET_ENV_HINTS: [&str; 8] = [
+    "KEY",
+    "SECRET",
+    "TOKEN",
+    "PASSWORD",
+    "PASSWD",
+    "AUTH",
+    "CREDENTIAL",
+    "PRIVATE",
+];
+
+/// The environment a child process is allowed to inherit.
+///
+/// This process holds the provider key: it is read from `.env` at startup and
+/// lives in our own environment for the whole run. A command the model asks
+/// for would inherit it by default, and `env` or `printenv` would hand it
+/// straight back into the transcript. Blocking reads of `.env` is pointless
+/// if the value is sitting in the child's environment anyway.
+///
+/// A block list rather than an allow list, so `PATH`, `HOME` and the rest of
+/// a working shell survive. It takes the variables as an argument rather than
+/// reading the environment itself, so it can be tested without touching the
+/// real one.
+pub fn scrub_env<I>(vars: I) -> Vec<(String, String)>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    vars.into_iter()
+        .filter(|(name, _)| !is_secret_env(name))
+        .collect()
+}
+
+fn is_secret_env(name: &str) -> bool {
+    let upper = name.to_uppercase();
+    SECRET_ENV_HINTS.iter().any(|hint| upper.contains(hint))
+}
+
 /// Why a path is off limits, or `None` if it is fine to touch.
 ///
 /// The reason is returned rather than a bare bool because it goes back to the
@@ -259,6 +299,55 @@ mod tests {
         assert!(is_shareable_env_file(Path::new("/p/.env.sample")));
         assert!(!is_shareable_env_file(Path::new("src/main.rs")));
         assert!(!is_shareable_env_file(Path::new(".env")));
+    }
+
+    fn scrubbed(vars: &[(&str, &str)]) -> Vec<String> {
+        scrub_env(
+            vars.iter()
+                .map(|(name, value)| (name.to_string(), value.to_string())),
+        )
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect()
+    }
+
+    #[test]
+    fn a_child_never_inherits_the_provider_key() {
+        // The reason this function exists: `printenv` would otherwise hand
+        // the key back into the transcript.
+        let kept = scrubbed(&[
+            ("SARVAM_API_KEY", "sk_real"),
+            ("OPENAI_API_KEY", "sk-real"),
+            ("PATH", "/usr/bin"),
+        ]);
+        assert_eq!(kept, vec!["PATH"]);
+    }
+
+    #[test]
+    fn strips_credentials_by_any_common_name() {
+        let kept = scrubbed(&[
+            ("GITHUB_TOKEN", "x"),
+            ("AWS_SECRET_ACCESS_KEY", "x"),
+            ("DB_PASSWORD", "x"),
+            ("SSH_AUTH_SOCK", "/tmp/s"),
+            ("aws_secret_access_key", "x"),
+            ("MY_PRIVATE_CERT", "x"),
+        ]);
+        assert!(kept.is_empty(), "leaked: {kept:?}");
+    }
+
+    #[test]
+    fn a_working_shell_survives() {
+        // Scrubbing everything would be safe and useless.
+        let kept = scrubbed(&[
+            ("PATH", "/usr/bin"),
+            ("HOME", "/Users/x"),
+            ("LANG", "en_US.UTF-8"),
+            ("TERM", "xterm"),
+            ("PWD", "/p"),
+            ("SHELL", "/bin/zsh"),
+        ]);
+        assert_eq!(kept.len(), 6, "dropped something a shell needs: {kept:?}");
     }
 
     #[test]

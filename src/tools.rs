@@ -7,7 +7,11 @@
 
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::policy;
 
@@ -19,6 +23,13 @@ const MAX_READ_FILE_BYTES: u64 = 512 * 1024 * 1024;
 /// The largest file the agent may write. Content comes from the model, so
 /// this is a backstop against a runaway generation, not a workflow limit.
 const MAX_WRITE_FILE_BYTES: usize = 8 * 1024 * 1024;
+
+/// How long a command may run before its process group is killed. A hung
+/// build must not hang the agent.
+pub const DEFAULT_EXEC_TIMEOUT_SECS: u64 = 120;
+
+/// How often the runtime checks whether a command has finished.
+const EXEC_POLL: Duration = Duration::from_millis(20);
 
 /// Lines of new content shown to the human when asking to approve a write.
 const PREVIEW_LINES: usize = 12;
@@ -70,6 +81,10 @@ their own .env"
         path: String,
         source: std::io::Error,
     },
+    #[error("could not run the command: {0}")]
+    Spawn(std::io::Error),
+    #[error("command was killed after {secs}s without finishing")]
+    ExecTimeout { secs: u64 },
 }
 
 /// A tool as the model should see it, in no provider's shape. Each transport
@@ -115,6 +130,14 @@ impl Registry {
             tools: vec![Box::new(ReadFile), Box::new(WriteFile)],
             max_output_bytes,
         }
+    }
+
+    /// Add the command tool. Off by default, and when it is off the tool is
+    /// absent from the spec entirely rather than refused on use: a tool the
+    /// model cannot see is one it does not keep trying.
+    pub fn with_exec(mut self, timeout: Duration) -> Self {
+        self.tools.push(Box::new(RunCommand { timeout }));
+        self
     }
 
     /// The tool list sent to the model, generated from the handlers above.
@@ -463,6 +486,155 @@ fn check_write(path: &str, target: &Path, content: &str) -> Result<(), ToolError
         }
     }
     Ok(())
+}
+
+struct RunCommand {
+    timeout: Duration,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunCommandArgs {
+    command: String,
+}
+
+impl Tool for RunCommand {
+    fn name(&self) -> &'static str {
+        "run_command"
+    }
+
+    fn mutates(&self) -> bool {
+        true
+    }
+
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: self.name(),
+            description: "Run a shell command in the project directory and return its \
+output and exit status. The user is shown the command and may refuse it. There is no \
+interactive input: a command that waits for stdin will time out. Credentials are removed \
+from the environment, so printing them is not possible.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The shell command, e.g. cargo test or ls src. Runs with the project root as the working directory."
+                    }
+                },
+                "required": ["command"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    /// The command itself is what the human is approving. Nothing is
+    /// summarised away: the whole point is that they read it.
+    fn preview(&self, arguments: &str, root: &Path) -> Result<String, ToolError> {
+        let args: RunCommandArgs =
+            serde_json::from_str(arguments).map_err(ToolError::InvalidArguments)?;
+        Ok(format!("{}\n  in {}", args.command, root.display()))
+    }
+
+    fn call(&self, arguments: &str, root: &Path) -> Result<String, ToolError> {
+        let args: RunCommandArgs =
+            serde_json::from_str(arguments).map_err(ToolError::InvalidArguments)?;
+        run_command(&args.command, root, self.timeout)
+    }
+}
+
+fn run_command(command: &str, root: &Path, timeout: Duration) -> Result<String, ToolError> {
+    let mut child = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(command)
+        .current_dir(root)
+        // Start from nothing and add back only what survives scrubbing, so a
+        // variable added to this process later cannot leak by being forgotten
+        // here.
+        .env_clear()
+        .envs(policy::scrub_env(std::env::vars()))
+        // No interactive input exists to give it; without this a command that
+        // reads stdin would inherit the terminal and swallow the approval for
+        // the next one.
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // Its own process group, so a timeout can kill what it spawned and
+        // not just the shell that spawned them.
+        .process_group(0)
+        .spawn()
+        .map_err(ToolError::Spawn)?;
+
+    // Drained on threads: a command that fills the pipe buffer would block
+    // forever if we only waited on the process.
+    let mut stdout = child.stdout.take().expect("stdout is piped");
+    let mut stderr = child.stderr.take().expect("stderr is piped");
+    let stdout = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = stdout.read_to_end(&mut buffer);
+        buffer
+    });
+    let stderr = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = stderr.read_to_end(&mut buffer);
+        buffer
+    });
+
+    let pid = child.id();
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Err(_) => break None,
+            Ok(None) => {}
+        }
+        if Instant::now() >= deadline {
+            kill_group(pid);
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(EXEC_POLL);
+    };
+
+    // The readers end once every writer is closed, which the kill guarantees.
+    let out = String::from_utf8_lossy(&stdout.join().unwrap_or_default()).into_owned();
+    let err = String::from_utf8_lossy(&stderr.join().unwrap_or_default()).into_owned();
+
+    let Some(status) = status else {
+        return Err(ToolError::ExecTimeout {
+            secs: timeout.as_secs(),
+        });
+    };
+
+    // A non-zero exit is an answer, not a failure of the tool: a failing
+    // `cargo test` is exactly what the model asked to see.
+    let mut report = match status.code() {
+        Some(0) => String::from("exit 0"),
+        Some(code) => format!("exit {code}"),
+        None => String::from("killed by a signal"),
+    };
+    if !out.trim().is_empty() {
+        report.push_str("\n--- stdout ---\n");
+        report.push_str(out.trim_end());
+    }
+    if !err.trim().is_empty() {
+        report.push_str("\n--- stderr ---\n");
+        report.push_str(err.trim_end());
+    }
+    if out.trim().is_empty() && err.trim().is_empty() {
+        report.push_str("\n(no output)");
+    }
+    Ok(report)
+}
+
+/// Kill the whole group. `Child::kill` would end the shell and leave whatever
+/// it started running, holding the pipes open.
+fn kill_group(pid: u32) {
+    // Negative pid means the process group, which `process_group(0)` set to
+    // the child's own pid.
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
 }
 
 fn check_write_size(content: &str) -> Result<(), ToolError> {
@@ -898,6 +1070,193 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArguments(_)), "got {err}");
         assert!(!dir.join("a.txt").exists());
+    }
+
+    // --- run_command ---
+
+    fn exec_registry() -> Registry {
+        Registry::new(DEFAULT_MAX_TOOL_OUTPUT_BYTES).with_exec(Duration::from_secs(10))
+    }
+
+    fn run(command: &str) -> Result<String, ToolError> {
+        run_in(&project_root(), command, &mut allow)
+    }
+
+    fn run_in(
+        dir: &Path,
+        command: &str,
+        approve: &mut dyn FnMut(&str, &str) -> bool,
+    ) -> Result<String, ToolError> {
+        exec_registry().dispatch(
+            "run_command",
+            &format!("{{\"command\":{}}}", json!(command)),
+            dir,
+            approve,
+        )
+    }
+
+    #[test]
+    fn a_withheld_command_tool_is_absent_rather_than_refused() {
+        // `--no-exec` takes it out of the spec entirely. A tool the model
+        // cannot see is one it does not keep trying to use.
+        let registry = Registry::new(DEFAULT_MAX_TOOL_OUTPUT_BYTES);
+        assert!(!registry.names().contains("run_command"));
+        assert!(!registry.specs().iter().any(|s| s.name == "run_command"));
+
+        let err = registry
+            .dispatch(
+                "run_command",
+                r#"{"command":"echo hi"}"#,
+                &project_root(),
+                &mut allow,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::UnsupportedTool { .. }),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn enabling_it_puts_it_in_the_spec() {
+        let registry = exec_registry();
+        assert!(registry.names().contains("run_command"));
+        assert!(registry.specs().iter().any(|s| s.name == "run_command"));
+    }
+
+    #[test]
+    fn runs_a_command_and_reports_its_output() {
+        let out = run("echo hello").unwrap();
+        assert!(out.starts_with("exit 0"), "{out}");
+        assert!(out.contains("hello"), "{out}");
+    }
+
+    #[test]
+    fn a_failing_command_is_an_answer_not_an_error() {
+        // A failing `cargo test` is exactly what the model asked to see.
+        let out = run("echo oops >&2; exit 3").unwrap();
+        assert!(out.contains("exit 3"), "{out}");
+        assert!(out.contains("--- stderr ---"), "{out}");
+        assert!(out.contains("oops"), "{out}");
+    }
+
+    #[test]
+    fn runs_in_the_project_directory() {
+        let dir = scratch_project("exec-cwd");
+        std::fs::write(dir.join("marker.txt"), "x").unwrap();
+        let out = run_in(&dir, "ls", &mut allow).unwrap();
+        assert!(out.contains("marker.txt"), "{out}");
+    }
+
+    #[test]
+    fn a_command_is_not_run_without_approval() {
+        let dir = scratch_project("exec-refused");
+        let err = run_in(&dir, "touch created.txt", &mut refuse).unwrap_err();
+        assert!(matches!(err, ToolError::Denied { .. }), "got {err}");
+        assert!(!dir.join("created.txt").exists(), "ran despite refusal");
+    }
+
+    #[test]
+    fn the_preview_shows_the_command_verbatim() {
+        // The human is approving the command, so it must not be summarised.
+        let dir = scratch_project("exec-preview");
+        let mut seen = String::new();
+        let mut capture = |_: &str, preview: &str| {
+            seen = preview.to_string();
+            true
+        };
+        run_in(&dir, "rm -rf build && make", &mut capture).unwrap();
+        assert!(seen.contains("rm -rf build && make"), "{seen}");
+    }
+
+    #[test]
+    fn a_hung_command_is_killed() {
+        let registry =
+            Registry::new(DEFAULT_MAX_TOOL_OUTPUT_BYTES).with_exec(Duration::from_millis(300));
+        let err = registry
+            .dispatch(
+                "run_command",
+                r#"{"command":"sleep 30"}"#,
+                &project_root(),
+                &mut allow,
+            )
+            .unwrap_err();
+        assert!(matches!(err, ToolError::ExecTimeout { .. }), "got {err}");
+    }
+
+    #[test]
+    fn a_timeout_kills_the_whole_process_group() {
+        // `Child::kill` would end the shell and leave the sleep running,
+        // holding the pipe open and hanging the read.
+        let dir = scratch_project("exec-group");
+        let registry =
+            Registry::new(DEFAULT_MAX_TOOL_OUTPUT_BYTES).with_exec(Duration::from_millis(300));
+        let started = Instant::now();
+        let err = registry
+            .dispatch(
+                "run_command",
+                r#"{"command":"sleep 30 & sleep 30"}"#,
+                &dir,
+                &mut allow,
+            )
+            .unwrap_err();
+        assert!(matches!(err, ToolError::ExecTimeout { .. }), "got {err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "took {:?}; a grandchild was left holding the pipe",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_command_waiting_for_input_does_not_hang_the_agent() {
+        let registry =
+            Registry::new(DEFAULT_MAX_TOOL_OUTPUT_BYTES).with_exec(Duration::from_secs(5));
+        let out = registry
+            .dispatch(
+                "run_command",
+                r#"{"command":"cat"}"#,
+                &project_root(),
+                &mut allow,
+            )
+            .unwrap();
+        // stdin is /dev/null, so `cat` sees EOF at once instead of waiting.
+        assert!(out.starts_with("exit 0"), "{out}");
+    }
+
+    #[test]
+    fn a_command_cannot_print_the_provider_key() {
+        // The whole reason the environment is scrubbed: blocking reads of
+        // .env is pointless if printenv hands the value back.
+        let out = run("printenv | grep -ci 'API_KEY' || true").unwrap();
+        assert!(out.contains("exit 0"), "{out}");
+        let count: usize = out
+            .lines()
+            .last()
+            .unwrap_or("0")
+            .trim()
+            .parse()
+            .unwrap_or(999);
+        assert_eq!(count, 0, "a key-shaped variable reached the child: {out}");
+    }
+
+    #[test]
+    fn a_command_still_gets_a_usable_shell() {
+        let out = run("test -n \"$PATH\" && echo has-path").unwrap();
+        assert!(out.contains("has-path"), "scrubbing broke the shell: {out}");
+    }
+
+    #[test]
+    fn exec_rejects_invented_arguments() {
+        let err = exec_registry()
+            .dispatch(
+                "run_command",
+                r#"{"command":"echo hi","timeout":5}"#,
+                &project_root(),
+                &mut allow,
+            )
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments(_)), "got {err}");
     }
 
     // --- the privacy boundary ---

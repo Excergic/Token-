@@ -14,6 +14,8 @@ cp .env.example .env        # then put a real key in it
 cargo run -- "Explain src/main.rs"                    # openai, gpt-5.5
 cargo run -- --provider sarvam "Explain src/main.rs"  # sarvam-105b
 cargo run -- --resume "And what calls it?"            # continue this directory
+cargo run -- "Run the tests and tell me what fails"  # asks before each command
+cargo run -- --no-exec "Explain src/runtime.rs"      # no shell tool at all
 cargo test
 ```
 
@@ -38,6 +40,7 @@ llm/mod.rs     Transport trait, ApiMode ladder, stateless HTTP client
 llm/chat.rs    the ONLY module that knows the chat/completions JSON
 llm/responses.rs  the ONLY module that knows the Responses JSON
 tools.rs       Tool trait, Registry, handlers; know nothing about conversations
+               read_file, write_file, run_command all live behind that trait
 policy.rs      what the agent may never read or write; no I/O, pure decisions
 secrets.rs     redaction for secrets policy.rs had no chance to refuse
 ```
@@ -119,12 +122,32 @@ transcript can be inspected, truncated or replayed later.
   missed secret is a risk; a corrupted file is a certainty. Tests pin both
   directions, and redaction is idempotent so a resumed transcript does not
   nest markers.
+- **The command tool is on by default; approval is the gate.** A coding agent
+  that cannot run the tests is half a tool, so `run_command` is offered unless
+  `--no-exec` withholds it. The per-command prompt is what protects the user,
+  not the absence of the tool. When it is withheld it leaves the spec entirely
+  rather than being refused on use: a tool the model cannot see is one it does
+  not keep trying, or work around.
+- **A child process inherits nothing that looks like a credential.**
+  `policy::scrub_env` starts from `env_clear()` and adds back only names
+  carrying none of KEY / SECRET / TOKEN / PASSWORD / AUTH / CREDENTIAL /
+  PRIVATE. Denying reads of `.env` is pointless if `printenv` hands the value
+  back. A block list, not an allow list, so `PATH` and `HOME` survive and the
+  shell still works.
+- **A command gets its own process group and is killed as one.** `Child::kill`
+  would end the shell and leave what it spawned running, holding the pipe open
+  and hanging the read. stdout and stderr are drained on threads, because a
+  command that fills the pipe buffer would otherwise block forever; stdin is
+  `/dev/null`, so nothing can sit waiting for input that will never come.
+- **A non-zero exit is an answer, not a tool failure.** A failing `cargo test`
+  is what the model asked to see, so the status and output come back as a
+  result. Only a timeout or a failure to spawn is an error.
 - **Ask before deciding.** Limits, loop bounds, error handling, prompt wording
   and module placement are the owner's calls, not defaults to pick silently.
 
 ## Not built yet (deliberate)
 
-Any exec tool; a file-slice read; an append or partial edit (`write_file`
+A file-slice read; an append or partial edit (`write_file`
 replaces a file whole); writes outside the project directory; `max_tokens` /
 `reasoning_effort` / `max_output_tokens` in the request (their absence causes
 intermittent `finish_reason: length` empty answers); carrying OpenAI reasoning
@@ -136,9 +159,12 @@ and transcript compression (nothing prunes a session, so a long-running
 directory grows until the context cap bites); a read sandbox (`policy.rs` is a
 blocklist, not confinement: anything it does not name is readable, and
 `read_file` still reaches outside the project even though `write_file` cannot);
-env filtering for a future exec tool (a child process would inherit
-`OPENAI_API_KEY` / `SARVAM_API_KEY` from this one, so an exec tool must strip
-them before it is shipped); a configurable turn limit (`MAX_TURNS` is 10, and a 12-file task exhausts it).
+any isolation for `run_command` (the
+environment is scrubbed and the user approves each command, but it runs as you,
+in your project, with your network: the envelope is the whole defence, and
+`--yes` removes the asking); a persistent kernel, so nothing carries between
+commands and each starts fresh; Windows support for `run_command` (it assumes
+`/bin/sh` and POSIX process groups); a configurable turn limit (`MAX_TURNS` is 10, and a 12-file task exhausts it).
 
 ## Environment note
 
