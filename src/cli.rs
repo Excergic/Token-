@@ -2,7 +2,7 @@ use clap::Parser;
 use std::path::PathBuf;
 
 use crate::llm::{ApiMode, Provider};
-use crate::tools::DEFAULT_MAX_TOOL_OUTPUT_BYTES;
+use crate::tools::{DEFAULT_EXEC_TIMEOUT_SECS, DEFAULT_MAX_TOOL_OUTPUT_BYTES};
 
 /// A CLI coding agent. Talks to OpenAI by default; `--provider sarvam` and any
 /// OpenAI-compatible endpoint via `--base-url` also work.
@@ -38,8 +38,17 @@ pub struct Cli {
     #[arg(long, value_name = "KEY", hide_env_values = true)]
     api_key: Option<String>,
 
-    /// Apply file changes without asking. Every write is approved by the user
-    /// unless this is set.
+    /// Withhold the shell command tool. It is offered by default; with this
+    /// set the model is not given it at all, rather than refused on use.
+    #[arg(long)]
+    pub no_exec: bool,
+
+    /// Seconds a command may run before it is killed
+    #[arg(long, value_name = "SECS", default_value_t = DEFAULT_EXEC_TIMEOUT_SECS)]
+    pub exec_timeout: u64,
+
+    /// Apply file changes without asking. Every write and every command is
+    /// approved by the user unless this is set.
     #[arg(long, short = 'y')]
     pub yes: bool,
 

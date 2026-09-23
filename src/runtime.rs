@@ -1,5 +1,6 @@
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::conversation::{Conversation, Message};
 use crate::llm::{LlmClient, LlmError};
@@ -61,6 +62,13 @@ impl AgentRuntime {
             resume: false,
             auto_approve: false,
         }
+    }
+
+    /// Offer the command tool. Without this it is absent from the tool list
+    /// the model is given, not merely refused when used.
+    pub fn with_exec(mut self, timeout: Duration) -> Self {
+        self.tools = self.tools.with_exec(timeout);
+        self
     }
 
     /// Stop asking before each file change. The default is to ask.
