@@ -139,6 +139,23 @@ transcript can be inspected, truncated or replayed later.
   and hanging the read. stdout and stderr are drained on threads, because a
   command that fills the pipe buffer would otherwise block forever; stdin is
   `/dev/null`, so nothing can sit waiting for input that will never come.
+- **A shell goes around every path rule, so the command text is read.**
+  `run_command` can `rm .env` or `cat /etc/hosts`; neither is a write the
+  registry can refuse. `policy::command_concerns` names what a command touches
+  that is private or outside the project, and those reasons are shown in the
+  approval prompt. **This is string matching, not a boundary**: `cat .e""nv`,
+  `$HOME/.ssh/id_rsa` and `eval` defeat it. It exists to stop an accident and
+  must never be described as containment.
+- **`--yes` does not cover a command carrying a concern.** It approves the
+  routine case; a command naming a secret or leaving the project is the one the
+  user meant to see, so it is always asked. That makes a scripted run fail
+  closed on exactly those commands, which is the intended trade. Concerns ride
+  on `Approval`, so the decision about what may be waved through lives with the
+  request rather than in the prompt.
+- **Flagging must stay rare to stay meaningful.** `cargo test`, `ls src`,
+  `rm -rf target` and `rustc hello.rs && ./hello` carry no concern. A prompt
+  that warns about everything teaches the user to approve without reading, so
+  tests pin the quiet cases as firmly as the loud ones.
 - **A non-zero exit is an answer, not a tool failure.** A failing `cargo test`
   is what the model asked to see, so the status and output come back as a
   result. Only a timeout or a failure to spawn is an error.
@@ -160,9 +177,10 @@ directory grows until the context cap bites); a read sandbox (`policy.rs` is a
 blocklist, not confinement: anything it does not name is readable, and
 `read_file` still reaches outside the project even though `write_file` cannot);
 any isolation for `run_command` (the
-environment is scrubbed and the user approves each command, but it runs as you,
-in your project, with your network: the envelope is the whole defence, and
-`--yes` removes the asking); a persistent kernel, so nothing carries between
+environment is scrubbed, the command text is screened and the user approves
+each one, but it runs as you, in your project, with your network: the envelope
+is the whole defence, and a quoted or variable-built path walks past the
+screening); a persistent kernel, so nothing carries between
 commands and each starts fresh; Windows support for `run_command` (it assumes
 `/bin/sh` and POSIX process groups); a configurable turn limit (`MAX_TURNS` is 10, and a 12-file task exhausts it).
 

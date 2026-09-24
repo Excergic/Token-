@@ -97,6 +97,15 @@ pub struct ToolSpec {
     pub parameters: Value,
 }
 
+/// What the human is being asked to allow. A struct rather than three
+/// arguments because `concerns` is the part that changes what the answer is
+/// allowed to be: a request carrying any cannot be waved through by `--yes`.
+pub struct Approval<'a> {
+    pub tool: &'a str,
+    pub preview: &'a str,
+    pub concerns: &'a [String],
+}
+
 /// A tool the model can call. One implementation carries both the schema the
 /// model sees and the code that runs, so the two cannot drift apart.
 pub trait Tool {
@@ -114,6 +123,13 @@ pub trait Tool {
     /// filesystem to describe the change, but must not make it.
     fn preview(&self, arguments: &str, _root: &Path) -> Result<String, ToolError> {
         Ok(arguments.to_string())
+    }
+
+    /// Reasons this particular call deserves a fresh answer even when the
+    /// user has said yes to everything. Empty for a tool whose arguments are
+    /// already confined by the time they get here.
+    fn concerns(&self, _arguments: &str, _root: &Path) -> Vec<String> {
+        Vec::new()
     }
 }
 
@@ -165,7 +181,7 @@ impl Registry {
         name: &str,
         arguments: &str,
         root: &Path,
-        approve: &mut dyn FnMut(&str, &str) -> bool,
+        approve: &mut dyn FnMut(&Approval) -> bool,
     ) -> Result<String, ToolError> {
         let Some(tool) = self.tools.iter().find(|tool| tool.name() == name) else {
             return Err(ToolError::UnsupportedTool {
@@ -178,7 +194,13 @@ impl Registry {
             // Arguments are validated by `preview` first, so a malformed call
             // is refused before anyone is asked to approve it.
             let preview = tool.preview(arguments, root)?;
-            if !approve(tool.name(), &preview) {
+            let concerns = tool.concerns(arguments, root);
+            let request = Approval {
+                tool: tool.name(),
+                preview: &preview,
+                concerns: &concerns,
+            };
+            if !approve(&request) {
                 return Err(ToolError::Denied {
                     path: preview.lines().next().unwrap_or(name).to_string(),
                 });
@@ -536,6 +558,19 @@ from the environment, so printing them is not possible.",
         Ok(format!("{}\n  in {}", args.command, root.display()))
     }
 
+    /// A shell drives straight around the path handling `write_file` enforces,
+    /// so what the command names is read and reported. String matching, not a
+    /// boundary: it stops an accident and keeps `--yes` from covering the
+    /// commands most worth looking at.
+    fn concerns(&self, arguments: &str, root: &Path) -> Vec<String> {
+        match serde_json::from_str::<RunCommandArgs>(arguments) {
+            Ok(args) => policy::command_concerns(&args.command, root),
+            // Unparseable arguments are rejected by `preview` before this
+            // matters; treating that as "no concerns" changes nothing.
+            Err(_) => Vec::new(),
+        }
+    }
+
     fn call(&self, arguments: &str, root: &Path) -> Result<String, ToolError> {
         let args: RunCommandArgs =
             serde_json::from_str(arguments).map_err(ToolError::InvalidArguments)?;
@@ -695,12 +730,12 @@ mod tests {
     }
 
     /// Stands in for the human saying yes.
-    fn allow(_tool: &str, _preview: &str) -> bool {
+    fn allow(_request: &Approval) -> bool {
         true
     }
 
     /// Stands in for the human saying no.
-    fn refuse(_tool: &str, _preview: &str) -> bool {
+    fn refuse(_request: &Approval) -> bool {
         false
     }
 
@@ -712,7 +747,7 @@ mod tests {
         dir: &Path,
         path: &str,
         content: &str,
-        approve: &mut dyn FnMut(&str, &str) -> bool,
+        approve: &mut dyn FnMut(&Approval) -> bool,
     ) -> Result<String, ToolError> {
         Registry::new(DEFAULT_MAX_TOOL_OUTPUT_BYTES).dispatch(
             "write_file",
@@ -1015,7 +1050,7 @@ mod tests {
     fn approval_is_only_asked_for_tools_that_change_things() {
         // read_file must never trigger a prompt.
         let mut asked = false;
-        let mut spy = |_: &str, _: &str| {
+        let mut spy = |_: &Approval| {
             asked = true;
             true
         };
@@ -1034,8 +1069,8 @@ mod tests {
     fn the_preview_shows_the_path_and_the_first_lines() {
         let dir = scratch_project("preview");
         let mut seen = String::new();
-        let mut capture = |_: &str, preview: &str| {
-            seen = preview.to_string();
+        let mut capture = |request: &Approval| {
+            seen = request.preview.to_string();
             true
         };
         write_in_with(&dir, "notes.md", "alpha\nbeta\n", &mut capture).unwrap();
@@ -1049,8 +1084,8 @@ mod tests {
         let dir = scratch_project("preview-overwrite");
         std::fs::write(dir.join("notes.md"), "old").unwrap();
         let mut seen = String::new();
-        let mut capture = |_: &str, preview: &str| {
-            seen = preview.to_string();
+        let mut capture = |request: &Approval| {
+            seen = request.preview.to_string();
             true
         };
         write_in_with(&dir, "notes.md", "new", &mut capture).unwrap();
@@ -1085,7 +1120,7 @@ mod tests {
     fn run_in(
         dir: &Path,
         command: &str,
-        approve: &mut dyn FnMut(&str, &str) -> bool,
+        approve: &mut dyn FnMut(&Approval) -> bool,
     ) -> Result<String, ToolError> {
         exec_registry().dispatch(
             "run_command",
@@ -1161,8 +1196,8 @@ mod tests {
         // The human is approving the command, so it must not be summarised.
         let dir = scratch_project("exec-preview");
         let mut seen = String::new();
-        let mut capture = |_: &str, preview: &str| {
-            seen = preview.to_string();
+        let mut capture = |request: &Approval| {
+            seen = request.preview.to_string();
             true
         };
         run_in(&dir, "rm -rf build && make", &mut capture).unwrap();
@@ -1247,6 +1282,56 @@ mod tests {
     }
 
     #[test]
+    fn a_command_naming_a_private_file_carries_a_concern() {
+        let dir = scratch_project("exec-concern");
+        let mut seen: Vec<String> = Vec::new();
+        let mut capture = |request: &Approval| {
+            seen = request.concerns.to_vec();
+            false
+        };
+        let _ = run_in(&dir, "rm .env", &mut capture);
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(seen[0].contains(".env"), "{seen:?}");
+    }
+
+    #[test]
+    fn a_command_leaving_the_project_carries_a_concern() {
+        let dir = scratch_project("exec-concern-escape");
+        let mut seen: Vec<String> = Vec::new();
+        let mut capture = |request: &Approval| {
+            seen = request.concerns.to_vec();
+            false
+        };
+        let _ = run_in(&dir, "rm /etc/hosts", &mut capture);
+        assert!(!seen.is_empty(), "an escape was not flagged");
+    }
+
+    #[test]
+    fn ordinary_work_carries_no_concern() {
+        // Flagging routine commands would teach the user to stop reading.
+        let dir = scratch_project("exec-no-concern");
+        let mut seen: Vec<String> = Vec::new();
+        let mut capture = |request: &Approval| {
+            seen = request.concerns.to_vec();
+            true
+        };
+        run_in(&dir, "echo hi", &mut capture).unwrap();
+        assert!(seen.is_empty(), "{seen:?}");
+    }
+
+    #[test]
+    fn a_write_carries_no_concern_because_its_paths_are_already_confined() {
+        let dir = scratch_project("write-no-concern");
+        let mut seen: Vec<String> = Vec::new();
+        let mut capture = |request: &Approval| {
+            seen = request.concerns.to_vec();
+            true
+        };
+        write_in_with(&dir, "notes.md", "hi", &mut capture).unwrap();
+        assert!(seen.is_empty(), "{seen:?}");
+    }
+
+    #[test]
     fn exec_rejects_invented_arguments() {
         let err = exec_registry()
             .dispatch(
@@ -1294,7 +1379,7 @@ mod tests {
         let dir = scratch_project("dotenv-no-prompt");
         std::fs::write(dir.join(".env"), "KEY=secret").unwrap();
         let mut asked = false;
-        let mut spy = |_: &str, _: &str| {
+        let mut spy = |_: &Approval| {
             asked = true;
             true
         };
