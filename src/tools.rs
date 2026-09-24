@@ -14,6 +14,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::policy;
+use crate::sandbox::{self, Backend, SandboxPolicy};
 
 /// Tier 1, the filesystem limit: the largest file we will read into memory at
 /// all. This only stops absurd reads; anything under it is read and then
@@ -151,8 +152,17 @@ impl Registry {
     /// Add the command tool. Off by default, and when it is off the tool is
     /// absent from the spec entirely rather than refused on use: a tool the
     /// model cannot see is one it does not keep trying.
-    pub fn with_exec(mut self, timeout: Duration) -> Self {
-        self.tools.push(Box::new(Terminal { timeout }));
+    pub fn with_exec(
+        mut self,
+        timeout: Duration,
+        backend: Backend,
+        sandbox: SandboxPolicy,
+    ) -> Self {
+        self.tools.push(Box::new(Terminal {
+            timeout,
+            backend,
+            sandbox,
+        }));
         self
     }
 
@@ -516,6 +526,8 @@ fn check_write(path: &str, target: &Path, content: &str) -> Result<(), ToolError
 /// reaches for turns those attempts into real calls instead of rejections.
 struct Terminal {
     timeout: Duration,
+    backend: Backend,
+    sandbox: SandboxPolicy,
 }
 
 #[derive(Deserialize)]
@@ -578,14 +590,30 @@ from the environment, so printing them is not possible.",
     fn call(&self, arguments: &str, root: &Path) -> Result<String, ToolError> {
         let args: TerminalArgs =
             serde_json::from_str(arguments).map_err(ToolError::InvalidArguments)?;
-        run_shell(&args.command, root, self.timeout)
+        run_shell(
+            &args.command,
+            root,
+            self.timeout,
+            self.backend,
+            &self.sandbox,
+        )
     }
 }
 
-fn run_shell(command: &str, root: &Path, timeout: Duration) -> Result<String, ToolError> {
-    let mut child = Command::new("/bin/sh")
-        .arg("-c")
-        .arg(command)
+fn run_shell(
+    command: &str,
+    root: &Path,
+    timeout: Duration,
+    backend: Backend,
+    policy: &SandboxPolicy,
+) -> Result<String, ToolError> {
+    // The sandbox decides what the command may touch; everything below still
+    // decides how it is run. Confinement does not replace the environment
+    // scrubbing, the process group or the timeout, it sits under them.
+    let (program, args) = sandbox::wrap(backend, policy, command);
+
+    let mut child = Command::new(program)
+        .args(args)
         .current_dir(root)
         // Start from nothing and add back only what survives scrubbing, so a
         // variable added to this process later cannot leak by being forgotten
@@ -1114,7 +1142,18 @@ mod tests {
     // --- terminal ---
 
     fn exec_registry() -> Registry {
-        Registry::new(DEFAULT_MAX_TOOL_OUTPUT_BYTES).with_exec(Duration::from_secs(10))
+        exec_registry_with(Duration::from_secs(10), &project_root())
+    }
+
+    /// Exercises the real backend: on macOS these tests run under Seatbelt,
+    /// so a policy that breaks a shell breaks the suite.
+    fn exec_registry_with(timeout: Duration, root: &Path) -> Registry {
+        let mode = sandbox::SandboxMode::WorkspaceWrite;
+        Registry::new(DEFAULT_MAX_TOOL_OUTPUT_BYTES).with_exec(
+            timeout,
+            sandbox::select(mode),
+            SandboxPolicy::new(mode, root, false),
+        )
     }
 
     fn run(command: &str) -> Result<String, ToolError> {
@@ -1210,8 +1249,7 @@ mod tests {
 
     #[test]
     fn a_hung_command_is_killed() {
-        let registry =
-            Registry::new(DEFAULT_MAX_TOOL_OUTPUT_BYTES).with_exec(Duration::from_millis(300));
+        let registry = exec_registry_with(Duration::from_millis(300), &project_root());
         let err = registry
             .dispatch(
                 "terminal",
@@ -1228,8 +1266,7 @@ mod tests {
         // `Child::kill` would end the shell and leave the sleep running,
         // holding the pipe open and hanging the read.
         let dir = scratch_project("exec-group");
-        let registry =
-            Registry::new(DEFAULT_MAX_TOOL_OUTPUT_BYTES).with_exec(Duration::from_millis(300));
+        let registry = exec_registry_with(Duration::from_millis(300), &dir);
         let started = Instant::now();
         let err = registry
             .dispatch(
@@ -1249,8 +1286,7 @@ mod tests {
 
     #[test]
     fn a_command_waiting_for_input_does_not_hang_the_agent() {
-        let registry =
-            Registry::new(DEFAULT_MAX_TOOL_OUTPUT_BYTES).with_exec(Duration::from_secs(5));
+        let registry = exec_registry_with(Duration::from_secs(5), &project_root());
         let out = registry
             .dispatch(
                 "terminal",
@@ -1346,6 +1382,99 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArguments(_)), "got {err}");
+    }
+
+    // --- the sandbox, where there is one ---
+
+    /// These assert what the kernel refuses. On a platform with no backend
+    /// there is nothing to assert, so they stand down rather than pass
+    /// vacuously and imply a boundary that is not there.
+    fn sandboxed() -> bool {
+        sandbox::select(sandbox::SandboxMode::WorkspaceWrite) != Backend::None
+    }
+
+    #[test]
+    fn the_sandbox_refuses_a_write_outside_the_project() {
+        if !sandboxed() {
+            return;
+        }
+        let dir = scratch_project("sb-escape");
+        // Somewhere outside both the project and the temp grant.
+        let target = format!("{}/token-sb-escaped.txt", std::env::var("HOME").unwrap());
+        let _ = std::fs::remove_file(&target);
+
+        // No `..` in the command, so `policy.rs` sees nothing to flag: this
+        // is the kernel refusing, not the screening.
+        let out = run_in(&dir, &format!("echo pwned > {target}"), &mut allow).unwrap();
+
+        assert!(!out.starts_with("exit 0"), "the write succeeded: {out}");
+        assert!(!Path::new(&target).exists(), "wrote outside the project");
+    }
+
+    #[test]
+    fn the_sandbox_refuses_to_read_a_dotenv_the_screening_would_miss() {
+        if !sandboxed() {
+            return;
+        }
+        // The hole the sandbox exists to close: a shell walks around
+        // `policy.rs`, and quoting the name walks around the screening too.
+        let dir = scratch_project("sb-dotenv");
+        std::fs::write(dir.join(".env"), "SECRET=real_value_here").unwrap();
+
+        let out = run_in(&dir, r#"cat ".e""nv""#, &mut allow).unwrap();
+        assert!(
+            !out.contains("real_value_here"),
+            "the secret was read: {out}"
+        );
+    }
+
+    #[test]
+    fn the_sandbox_leaves_the_example_dotenv_readable() {
+        if !sandboxed() {
+            return;
+        }
+        let dir = scratch_project("sb-dotenv-example");
+        std::fs::write(dir.join(".env.example"), "API_KEY=your_key_here").unwrap();
+
+        let out = run_in(&dir, "cat .env.example", &mut allow).unwrap();
+        assert!(out.contains("your_key_here"), "{out}");
+    }
+
+    #[test]
+    fn the_sandbox_allows_ordinary_work_in_the_project() {
+        // A sandbox that breaks the toolchain is one the user switches off.
+        if !sandboxed() {
+            return;
+        }
+        let dir = scratch_project("sb-ordinary");
+        let out = run_in(&dir, "echo hi > made.txt && cat made.txt", &mut allow).unwrap();
+        assert!(out.starts_with("exit 0"), "{out}");
+        assert!(out.contains("hi"), "{out}");
+        assert!(dir.join("made.txt").exists());
+    }
+
+    #[test]
+    fn read_only_mode_refuses_a_write_inside_the_project() {
+        if !sandboxed() {
+            return;
+        }
+        let dir = scratch_project("sb-readonly");
+        let mode = sandbox::SandboxMode::ReadOnly;
+        let registry = Registry::new(DEFAULT_MAX_TOOL_OUTPUT_BYTES).with_exec(
+            Duration::from_secs(10),
+            sandbox::select(mode),
+            SandboxPolicy::new(mode, &dir, false),
+        );
+        let out = registry
+            .dispatch(
+                "terminal",
+                r#"{"command":"echo x > nope.txt"}"#,
+                &dir,
+                &mut allow,
+            )
+            .unwrap();
+        assert!(!out.starts_with("exit 0"), "{out}");
+        assert!(!dir.join("nope.txt").exists());
     }
 
     // --- the privacy boundary ---

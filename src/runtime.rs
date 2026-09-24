@@ -4,9 +4,15 @@ use std::time::Duration;
 
 use crate::conversation::{Conversation, Message};
 use crate::llm::{LlmClient, LlmError};
+use crate::sandbox::{Backend, SandboxPolicy};
 use crate::secrets;
 use crate::session::{Session, SessionError, SessionStore};
 use crate::tools::{Approval, Registry};
+
+/// Stands in for a tool result with nothing in it. An empty string is not a
+/// valid tool message on at least one provider, and "nothing" is information
+/// the model needs either way.
+const EMPTY_RESULT: &str = "(the tool produced no output)";
 
 /// Most assistant turns one run may take before giving up.
 const MAX_TURNS: usize = 10;
@@ -66,8 +72,13 @@ impl AgentRuntime {
 
     /// Offer the command tool. Without this it is absent from the tool list
     /// the model is given, not merely refused when used.
-    pub fn with_exec(mut self, timeout: Duration) -> Self {
-        self.tools = self.tools.with_exec(timeout);
+    pub fn with_exec(
+        mut self,
+        timeout: Duration,
+        backend: Backend,
+        sandbox: SandboxPolicy,
+    ) -> Self {
+        self.tools = self.tools.with_exec(timeout, backend, sandbox);
         self
     }
 
@@ -169,12 +180,18 @@ impl AgentRuntime {
                     eprintln!("  ✗ redacted {} secret(s) from the result", result.count);
                 }
 
+                // A tool may legitimately produce nothing: an empty file, a
+                // command that printed nothing. The wire will not carry it -
+                // Sarvam rejects an empty tool message with a 400 - so say so
+                // in words instead of sending the emptiness.
+                let content = tool_content(result.text);
+
                 self.record(
                     &mut conversation,
                     &session,
                     Message::Tool {
                         tool_call_id: call.id,
-                        content: result.text,
+                        content,
                     },
                 )?;
             }
@@ -310,6 +327,16 @@ value. When you have what you need, answer directly.",
     }
 }
 
+/// A tool result as it goes on the wire. Nothing becomes words: an empty
+/// string is not a valid tool message on at least one provider, and "the tool
+/// produced nothing" is information the model needs either way.
+fn tool_content(text: String) -> String {
+    match text.is_empty() {
+        true => EMPTY_RESULT.to_string(),
+        false => text,
+    }
+}
+
 /// What the user said at the prompt.
 #[derive(Debug, PartialEq)]
 enum Decision {
@@ -367,6 +394,23 @@ mod tests {
             preview: "preview",
             concerns,
         }
+    }
+
+    #[test]
+    fn an_empty_tool_result_is_replaced_with_words() {
+        // Observed live: read_file on an empty file produced an empty tool
+        // message and Sarvam answered 400 "String should have at least 1
+        // character", ending the run.
+        assert_eq!(tool_content(String::new()), EMPTY_RESULT);
+        assert!(EMPTY_RESULT.contains("no output"));
+    }
+
+    #[test]
+    fn a_tool_result_with_content_is_passed_through() {
+        assert_eq!(tool_content("fn main() {}".into()), "fn main() {}");
+        // Whitespace is output: a command that printed a blank line said
+        // something, and trimming it away would be a different answer.
+        assert_eq!(tool_content("\n".into()), "\n");
     }
 
     #[test]
