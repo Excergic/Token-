@@ -152,7 +152,7 @@ impl Registry {
     /// absent from the spec entirely rather than refused on use: a tool the
     /// model cannot see is one it does not keep trying.
     pub fn with_exec(mut self, timeout: Duration) -> Self {
-        self.tools.push(Box::new(RunCommand { timeout }));
+        self.tools.push(Box::new(Terminal { timeout }));
         self
     }
 
@@ -510,19 +510,23 @@ fn check_write(path: &str, target: &Path, content: &str) -> Result<(), ToolError
     Ok(())
 }
 
-struct RunCommand {
+/// Named `terminal` on purpose. Before this tool existed the model kept
+/// inventing one by that name, with a `command` argument, and writing
+/// `<tool_call>terminal` into its message text. Matching the name it already
+/// reaches for turns those attempts into real calls instead of rejections.
+struct Terminal {
     timeout: Duration,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RunCommandArgs {
+struct TerminalArgs {
     command: String,
 }
 
-impl Tool for RunCommand {
+impl Tool for Terminal {
     fn name(&self) -> &'static str {
-        "run_command"
+        "terminal"
     }
 
     fn mutates(&self) -> bool {
@@ -553,7 +557,7 @@ from the environment, so printing them is not possible.",
     /// The command itself is what the human is approving. Nothing is
     /// summarised away: the whole point is that they read it.
     fn preview(&self, arguments: &str, root: &Path) -> Result<String, ToolError> {
-        let args: RunCommandArgs =
+        let args: TerminalArgs =
             serde_json::from_str(arguments).map_err(ToolError::InvalidArguments)?;
         Ok(format!("{}\n  in {}", args.command, root.display()))
     }
@@ -563,7 +567,7 @@ from the environment, so printing them is not possible.",
     /// boundary: it stops an accident and keeps `--yes` from covering the
     /// commands most worth looking at.
     fn concerns(&self, arguments: &str, root: &Path) -> Vec<String> {
-        match serde_json::from_str::<RunCommandArgs>(arguments) {
+        match serde_json::from_str::<TerminalArgs>(arguments) {
             Ok(args) => policy::command_concerns(&args.command, root),
             // Unparseable arguments are rejected by `preview` before this
             // matters; treating that as "no concerns" changes nothing.
@@ -572,13 +576,13 @@ from the environment, so printing them is not possible.",
     }
 
     fn call(&self, arguments: &str, root: &Path) -> Result<String, ToolError> {
-        let args: RunCommandArgs =
+        let args: TerminalArgs =
             serde_json::from_str(arguments).map_err(ToolError::InvalidArguments)?;
-        run_command(&args.command, root, self.timeout)
+        run_shell(&args.command, root, self.timeout)
     }
 }
 
-fn run_command(command: &str, root: &Path, timeout: Duration) -> Result<String, ToolError> {
+fn run_shell(command: &str, root: &Path, timeout: Duration) -> Result<String, ToolError> {
     let mut child = Command::new("/bin/sh")
         .arg("-c")
         .arg(command)
@@ -1107,7 +1111,7 @@ mod tests {
         assert!(!dir.join("a.txt").exists());
     }
 
-    // --- run_command ---
+    // --- terminal ---
 
     fn exec_registry() -> Registry {
         Registry::new(DEFAULT_MAX_TOOL_OUTPUT_BYTES).with_exec(Duration::from_secs(10))
@@ -1123,7 +1127,7 @@ mod tests {
         approve: &mut dyn FnMut(&Approval) -> bool,
     ) -> Result<String, ToolError> {
         exec_registry().dispatch(
-            "run_command",
+            "terminal",
             &format!("{{\"command\":{}}}", json!(command)),
             dir,
             approve,
@@ -1135,12 +1139,12 @@ mod tests {
         // `--no-exec` takes it out of the spec entirely. A tool the model
         // cannot see is one it does not keep trying to use.
         let registry = Registry::new(DEFAULT_MAX_TOOL_OUTPUT_BYTES);
-        assert!(!registry.names().contains("run_command"));
-        assert!(!registry.specs().iter().any(|s| s.name == "run_command"));
+        assert!(!registry.names().contains("terminal"));
+        assert!(!registry.specs().iter().any(|s| s.name == "terminal"));
 
         let err = registry
             .dispatch(
-                "run_command",
+                "terminal",
                 r#"{"command":"echo hi"}"#,
                 &project_root(),
                 &mut allow,
@@ -1155,8 +1159,8 @@ mod tests {
     #[test]
     fn enabling_it_puts_it_in_the_spec() {
         let registry = exec_registry();
-        assert!(registry.names().contains("run_command"));
-        assert!(registry.specs().iter().any(|s| s.name == "run_command"));
+        assert!(registry.names().contains("terminal"));
+        assert!(registry.specs().iter().any(|s| s.name == "terminal"));
     }
 
     #[test]
@@ -1210,7 +1214,7 @@ mod tests {
             Registry::new(DEFAULT_MAX_TOOL_OUTPUT_BYTES).with_exec(Duration::from_millis(300));
         let err = registry
             .dispatch(
-                "run_command",
+                "terminal",
                 r#"{"command":"sleep 30"}"#,
                 &project_root(),
                 &mut allow,
@@ -1229,7 +1233,7 @@ mod tests {
         let started = Instant::now();
         let err = registry
             .dispatch(
-                "run_command",
+                "terminal",
                 r#"{"command":"sleep 30 & sleep 30"}"#,
                 &dir,
                 &mut allow,
@@ -1249,7 +1253,7 @@ mod tests {
             Registry::new(DEFAULT_MAX_TOOL_OUTPUT_BYTES).with_exec(Duration::from_secs(5));
         let out = registry
             .dispatch(
-                "run_command",
+                "terminal",
                 r#"{"command":"cat"}"#,
                 &project_root(),
                 &mut allow,
@@ -1335,7 +1339,7 @@ mod tests {
     fn exec_rejects_invented_arguments() {
         let err = exec_registry()
             .dispatch(
-                "run_command",
+                "terminal",
                 r#"{"command":"echo hi","timeout":5}"#,
                 &project_root(),
                 &mut allow,

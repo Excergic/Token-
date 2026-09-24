@@ -103,6 +103,10 @@ impl AgentRuntime {
         }
         self.record(&mut conversation, &session, Message::User(task.to_string()))?;
 
+        // Set once the user picks "Allow Always". Scoped to this run, so the
+        // consent dies with the process and is never written down.
+        let mut allow_all = false;
+
         let mut corrections = 0;
         for _ in 0..MAX_TURNS {
             let completion = self.llm.send(conversation.messages(), &specs)?;
@@ -144,7 +148,7 @@ impl AgentRuntime {
             // reported to the model, not to the user: it can correct itself.
             for call in tool_calls {
                 eprintln!("→ {} {}", call.name, call.arguments);
-                let mut approve = |request: &Approval| self.approve(request);
+                let mut approve = |request: &Approval| self.approve(request, &mut allow_all);
                 let result =
                     match self
                         .tools
@@ -187,13 +191,16 @@ impl AgentRuntime {
     ///
     /// A request carrying concerns is always asked, `--yes` or not, so the
     /// flag cannot blanket-approve the commands most worth reading.
-    fn approve(&self, request: &Approval) -> bool {
-        // A command that names a secret or leaves the project is exactly the
-        // one the user meant to see. `--yes` covers the routine case; it does
-        // not get to cover this one.
-        if self.auto_approve && request.concerns.is_empty() {
+    fn approve(&self, request: &Approval, allow_all: &mut bool) -> bool {
+        if !needs_asking(request, self.auto_approve, *allow_all) {
             eprintln!("● {} {}", request.tool, request.preview);
-            eprintln!("  approved by --yes");
+            eprintln!(
+                "  approved by {}",
+                match self.auto_approve {
+                    true => "--yes",
+                    false => "Allow Always",
+                }
+            );
             return true;
         }
 
@@ -201,26 +208,50 @@ impl AgentRuntime {
         for concern in request.concerns {
             eprintln!("  ! {concern}");
         }
-        if self.auto_approve && !request.concerns.is_empty() {
-            eprintln!("  --yes does not cover this; answer for yourself");
+
+        // A flagged call is asked every time, so "Allow Always" cannot be
+        // honoured here. The option keeps its number rather than vanishing:
+        // a menu that changes shape between prompts is one people misread.
+        let flagged = !request.concerns.is_empty();
+        eprintln!();
+        eprintln!("  1) Allow Once");
+        match flagged {
+            true => {
+                eprintln!("  2) Allow Always - not available here, this must be answered each time")
+            }
+            false => {
+                eprintln!("  2) Allow Always - allows every change for the rest of this session")
+            }
         }
-        eprint!("  apply this change? [y/N] ");
+        eprintln!("  3) No");
+        eprint!("  choose [1/2/3]: ");
         let _ = std::io::stderr().flush();
 
         let mut answer = String::new();
-        let granted = match std::io::stdin().read_line(&mut answer) {
+        let decision = match std::io::stdin().read_line(&mut answer) {
             Ok(0) | Err(_) => {
                 if !std::io::stdin().is_terminal() {
-                    eprintln!("(no input; declined)");
+                    eprintln!("(no answer; declined)");
                 }
+                Decision::No
+            }
+            Ok(_) => decide(&answer),
+        };
+
+        match decision {
+            Decision::Always if !flagged => {
+                *allow_all = true;
+                eprintln!("  ✓ every change approved for the rest of this session");
+                true
+            }
+            // "Allow Always" on a flagged call is taken as Allow Once: this
+            // one proceeds, the next is still asked.
+            Decision::Always | Decision::Once => true,
+            Decision::No => {
+                eprintln!("  ✗ declined");
                 false
             }
-            Ok(_) => matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes"),
-        };
-        if !granted {
-            eprintln!("  ✗ declined");
         }
-        granted
     }
 
     /// Restore this directory's conversation, or begin one. Without a store
@@ -279,6 +310,39 @@ value. When you have what you need, answer directly.",
     }
 }
 
+/// What the user said at the prompt.
+#[derive(Debug, PartialEq)]
+enum Decision {
+    Once,
+    Always,
+    No,
+}
+
+/// Read the answer. The menu is numbered, but the words it prints are
+/// accepted too, because someone reading "Allow Once" will type it.
+///
+/// Anything unrecognised is a no: the costly mistake is acting on consent the
+/// user did not give, so a typo declines rather than guessing.
+fn decide(answer: &str) -> Decision {
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "1" | "once" | "allow once" | "y" | "yes" => Decision::Once,
+        "2" | "always" | "allow always" | "a" => Decision::Always,
+        _ => Decision::No,
+    }
+}
+
+/// Whether this request has to go to the user.
+///
+/// A concern always does, whatever standing consent exists: `--yes` and
+/// "Allow Always" both cover the routine case, and a call naming a secret or
+/// leaving the project is the one the user meant to see.
+fn needs_asking(request: &Approval, auto_approve: bool, allow_all: bool) -> bool {
+    if !request.concerns.is_empty() {
+        return true;
+    }
+    !(auto_approve || allow_all)
+}
+
 /// Markup a model emits when it imagines a tool it was never given. Matched
 /// against real output seen from this model, not invented patterns.
 fn looks_like_fake_tool_call(text: &str) -> bool {
@@ -296,6 +360,67 @@ fn looks_like_fake_tool_call(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn request<'a>(tool: &'a str, concerns: &'a [String]) -> Approval<'a> {
+        Approval {
+            tool,
+            preview: "preview",
+            concerns,
+        }
+    }
+
+    #[test]
+    fn reads_the_numbered_answers() {
+        assert_eq!(decide("1"), Decision::Once);
+        assert_eq!(decide("2"), Decision::Always);
+        assert_eq!(decide("3"), Decision::No);
+    }
+
+    #[test]
+    fn reads_the_words_the_menu_prints() {
+        // Someone shown "Allow Once" will type it rather than its number.
+        assert_eq!(decide("once"), Decision::Once);
+        assert_eq!(decide("Allow Once"), Decision::Once);
+        assert_eq!(decide("always"), Decision::Always);
+        assert_eq!(decide(" ALLOW ALWAYS \n"), Decision::Always);
+        assert_eq!(decide("no"), Decision::No);
+    }
+
+    #[test]
+    fn anything_unrecognised_declines() {
+        // A typo must not be read as consent.
+        assert_eq!(decide(""), Decision::No);
+        assert_eq!(decide("\n"), Decision::No);
+        assert_eq!(decide("4"), Decision::No);
+        assert_eq!(decide("yolo"), Decision::No);
+        assert_eq!(decide("allow"), Decision::No);
+    }
+
+    #[test]
+    fn a_fresh_run_asks_about_everything() {
+        assert!(needs_asking(&request("terminal", &[]), false, false));
+        assert!(needs_asking(&request("write_file", &[]), false, false));
+    }
+
+    #[test]
+    fn allow_always_covers_every_tool_for_the_rest_of_the_run() {
+        assert!(!needs_asking(&request("terminal", &[]), false, true));
+        assert!(!needs_asking(&request("write_file", &[]), false, true));
+    }
+
+    #[test]
+    fn a_concern_is_asked_despite_standing_consent() {
+        // The whole point of the escalation: neither --yes nor Allow Always
+        // covers a call naming a secret or leaving the project.
+        let flagged = ["`.env` is off limits".to_string()];
+        assert!(needs_asking(&request("terminal", &flagged), false, true));
+        assert!(needs_asking(&request("terminal", &flagged), true, true));
+    }
+
+    #[test]
+    fn yes_covers_the_routine_case() {
+        assert!(!needs_asking(&request("terminal", &[]), true, false));
+    }
 
     #[test]
     fn detects_the_markup_this_model_actually_emitted() {

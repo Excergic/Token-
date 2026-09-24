@@ -42,12 +42,6 @@ fn run(cli: &Cli) -> Result<String, Box<dyn Error>> {
     if !cli.no_exec {
         runtime = runtime.with_exec(Duration::from_secs(cli.exec_timeout));
     }
-
-    // `--yes` approves commands as well as writes, which is a different size
-    // of blast radius from approving file edits. Say so once, out loud.
-    if cli.yes && !cli.no_exec {
-        eprintln!("! --yes: shell commands will run without asking");
-    }
     if !cli.no_session {
         runtime = runtime.with_sessions(SessionStore::open(&cli.session_db())?, cli.resume);
     }

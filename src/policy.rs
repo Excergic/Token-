@@ -118,7 +118,7 @@ pub fn committed_secret(content: &str) -> Option<String> {
 
 /// What about a shell command deserves a second look, in the user's words.
 ///
-/// `run_command` is a shell: it drives straight around the path handling that
+/// `terminal` is a shell: it drives straight around the path handling that
 /// `read_file` and `write_file` enforce, and `rm .env` is not a write the
 /// registry can refuse. This reads the command text and names what it sees,
 /// so the approval prompt can say why it is worth reading carefully.

@@ -40,7 +40,7 @@ llm/mod.rs     Transport trait, ApiMode ladder, stateless HTTP client
 llm/chat.rs    the ONLY module that knows the chat/completions JSON
 llm/responses.rs  the ONLY module that knows the Responses JSON
 tools.rs       Tool trait, Registry, handlers; know nothing about conversations
-               read_file, write_file, run_command all live behind that trait
+               read_file, write_file, terminal all live behind that trait
 policy.rs      what the agent may never read or write; no I/O, pure decisions
 secrets.rs     redaction for secrets policy.rs had no chance to refuse
 ```
@@ -91,8 +91,18 @@ transcript can be inspected, truncated or replayed later.
   tool as changing the filesystem; the registry asks before dispatching one and
   never asks for anything else. `approve` is a parameter, so `tools.rs` stays
   free of terminal I/O and a test can answer for itself. Silence is a no: a
-  closed stdin, an unanswered prompt and a read error all decline, because the
-  costly mistake is writing a file nobody agreed to. `--yes` skips the asking.
+  closed stdin, an unanswered prompt, a read error and an answer that is not
+  recognised all decline, because the costly mistake is acting on consent the
+  user did not give. `--yes` skips the asking for every tool.
+- **The prompt is a numbered menu, spelled out.** `1) Allow Once`,
+  `2) Allow Always`, `3) No` - not bare letters, because `[y/a/N]` makes the
+  reader guess which letter does the irreversible thing. Typing the words works
+  as well as the numbers. "Allow Always" covers every change for the rest of
+  the run and is a plain `bool` owned by `run()`, so it dies with the process
+  and never reaches the session database: standing consent that outlived the
+  task would be consent the user cannot see or revoke. On a flagged call
+  option 2 keeps its number and says it is unavailable rather than vanishing,
+  because a menu that changes shape between prompts is one people misread.
 - **Secrets are refused before they are opened, not after.** `policy.rs` denies
   `.env`, key material and credential files to reads and writes alike. Once a
   key reaches the model it has left the machine and is in the session database,
@@ -123,8 +133,10 @@ transcript can be inspected, truncated or replayed later.
   directions, and redaction is idempotent so a resumed transcript does not
   nest markers.
 - **The command tool is on by default; approval is the gate.** A coding agent
-  that cannot run the tests is half a tool, so `run_command` is offered unless
-  `--no-exec` withholds it. The per-command prompt is what protects the user,
+  that cannot run the tests is half a tool, so `terminal` is offered unless
+  `--no-exec` withholds it. It is named `terminal` because that is the tool the
+  model kept inventing before it existed, `command` argument and all: matching
+  the name it reaches for turns hallucinated calls into real ones. The per-command prompt is what protects the user,
   not the absence of the tool. When it is withheld it leaves the spec entirely
   rather than being refused on use: a tool the model cannot see is one it does
   not keep trying, or work around.
@@ -140,14 +152,14 @@ transcript can be inspected, truncated or replayed later.
   command that fills the pipe buffer would otherwise block forever; stdin is
   `/dev/null`, so nothing can sit waiting for input that will never come.
 - **A shell goes around every path rule, so the command text is read.**
-  `run_command` can `rm .env` or `cat /etc/hosts`; neither is a write the
+  `terminal` can `rm .env` or `cat /etc/hosts`; neither is a write the
   registry can refuse. `policy::command_concerns` names what a command touches
   that is private or outside the project, and those reasons are shown in the
   approval prompt. **This is string matching, not a boundary**: `cat .e""nv`,
   `$HOME/.ssh/id_rsa` and `eval` defeat it. It exists to stop an accident and
   must never be described as containment.
-- **`--yes` does not cover a command carrying a concern.** It approves the
-  routine case; a command naming a secret or leaving the project is the one the
+- **Neither `--yes` nor "Allow Always" covers a command carrying a concern.** They
+  approve the routine case; a command naming a secret or leaving the project is the one the
   user meant to see, so it is always asked. That makes a scripted run fail
   closed on exactly those commands, which is the intended trade. Concerns ride
   on `Approval`, so the decision about what may be waved through lives with the
@@ -176,12 +188,12 @@ and transcript compression (nothing prunes a session, so a long-running
 directory grows until the context cap bites); a read sandbox (`policy.rs` is a
 blocklist, not confinement: anything it does not name is readable, and
 `read_file` still reaches outside the project even though `write_file` cannot);
-any isolation for `run_command` (the
+any isolation for `terminal` (the
 environment is scrubbed, the command text is screened and the user approves
 each one, but it runs as you, in your project, with your network: the envelope
 is the whole defence, and a quoted or variable-built path walks past the
 screening); a persistent kernel, so nothing carries between
-commands and each starts fresh; Windows support for `run_command` (it assumes
+commands and each starts fresh; Windows support for `terminal` (it assumes
 `/bin/sh` and POSIX process groups); a configurable turn limit (`MAX_TURNS` is 10, and a 12-file task exhausts it).
 
 ## Environment note
