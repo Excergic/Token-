@@ -9,7 +9,7 @@
 //! knows about; it does not confine it to the project. Write scope does that,
 //! and it is enforced separately in `tools.rs`.
 
-use std::path::Path;
+use std::path::{Component, Path};
 
 /// Directories whose contents are private wherever they appear in a path.
 /// `.config` is deliberately absent: projects keep ordinary settings there
@@ -114,6 +114,74 @@ pub fn committed_secret(content: &str) -> Option<String> {
         return Some(key.to_string());
     }
     None
+}
+
+/// What about a shell command deserves a second look, in the user's words.
+///
+/// `run_command` is a shell: it drives straight around the path handling that
+/// `read_file` and `write_file` enforce, and `rm .env` is not a write the
+/// registry can refuse. This reads the command text and names what it sees,
+/// so the approval prompt can say why it is worth reading carefully.
+///
+/// **This is not a security boundary and must never be sold as one.** It is
+/// string matching on a shell command: `cat .e""nv`, `$HOME/.ssh/id_rsa` and
+/// `eval` defeat it without effort. It exists to stop an accident, and to
+/// make `--yes` stop short of the commands most worth seeing. The approval
+/// prompt is the real gate.
+pub fn command_concerns(command: &str, root: &Path) -> Vec<String> {
+    let mut concerns: Vec<String> = Vec::new();
+    let mut note = |concern: String| {
+        if !concerns.contains(&concern) {
+            concerns.push(concern);
+        }
+    };
+
+    for token in path_like_tokens(command) {
+        // A flag is not a path. `-rf` should not be mistaken for one.
+        if token.starts_with('-') {
+            continue;
+        }
+        let path = Path::new(&token);
+
+        if let Some(reason) = private_reason(path) {
+            note(format!("`{token}` is normally off limits: {reason}"));
+            continue;
+        }
+        if token.starts_with('~') {
+            note(format!(
+                "`{token}` is in the home directory, outside the project"
+            ));
+            continue;
+        }
+        if path.is_absolute() && !path.starts_with(root) {
+            note(format!("`{token}` is outside the project"));
+            continue;
+        }
+        if path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+        {
+            note(format!("`{token}` reaches outside the project"));
+        }
+    }
+    concerns
+}
+
+/// Split a command into the words that might be paths. Deliberately crude:
+/// it splits on whitespace and shell punctuation and looks no further, since
+/// anything cleverer would invite belief in a guarantee this cannot give.
+fn path_like_tokens(command: &str) -> Vec<String> {
+    command
+        .split(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    ';' | '|' | '&' | '(' | ')' | '<' | '>' | '`' | '"' | '\'' | '='
+                )
+        })
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Substrings that mark an environment variable as carrying a credential.
@@ -348,6 +416,48 @@ mod tests {
             ("SHELL", "/bin/zsh"),
         ]);
         assert_eq!(kept.len(), 6, "dropped something a shell needs: {kept:?}");
+    }
+
+    fn concerns(command: &str) -> Vec<String> {
+        command_concerns(command, Path::new("/project"))
+    }
+
+    #[test]
+    fn a_command_naming_a_private_file_is_flagged() {
+        assert!(!concerns("rm .env").is_empty());
+        assert!(!concerns("cat ~/.ssh/id_rsa").is_empty());
+        assert!(!concerns("cp server.pem /tmp/x").is_empty());
+    }
+
+    #[test]
+    fn a_command_leaving_the_project_is_flagged() {
+        assert!(!concerns("rm /etc/hosts").is_empty());
+        assert!(!concerns("rm ../outside.txt").is_empty());
+        assert!(!concerns("rm -rf /").is_empty());
+        assert!(!concerns("cp notes.md ~/Desktop").is_empty());
+    }
+
+    #[test]
+    fn ordinary_project_work_is_not_flagged() {
+        // Flagging these would train the user to approve without reading.
+        assert!(concerns("cargo test").is_empty());
+        assert!(concerns("ls src").is_empty());
+        assert!(concerns("cat src/main.rs").is_empty());
+        assert!(concerns("grep -rn TODO .").is_empty());
+        assert!(concerns("rustc hello.rs -o hello && ./hello").is_empty());
+        assert!(concerns("rm -rf target").is_empty());
+    }
+
+    #[test]
+    fn a_path_inside_the_project_is_not_flagged_for_being_absolute() {
+        assert!(concerns("cat /project/src/main.rs").is_empty());
+    }
+
+    #[test]
+    fn the_concern_says_which_word_caused_it() {
+        let flagged = concerns("rm -rf build && cat .env");
+        assert_eq!(flagged.len(), 1, "{flagged:?}");
+        assert!(flagged[0].contains(".env"), "{flagged:?}");
     }
 
     #[test]

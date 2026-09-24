@@ -6,7 +6,7 @@ use crate::conversation::{Conversation, Message};
 use crate::llm::{LlmClient, LlmError};
 use crate::secrets;
 use crate::session::{Session, SessionError, SessionStore};
-use crate::tools::Registry;
+use crate::tools::{Approval, Registry};
 
 /// Most assistant turns one run may take before giving up.
 const MAX_TURNS: usize = 10;
@@ -144,7 +144,7 @@ impl AgentRuntime {
             // reported to the model, not to the user: it can correct itself.
             for call in tool_calls {
                 eprintln!("→ {} {}", call.name, call.arguments);
-                let mut approve = |tool: &str, preview: &str| self.approve(tool, preview);
+                let mut approve = |request: &Approval| self.approve(request);
                 let result =
                     match self
                         .tools
@@ -184,14 +184,26 @@ impl AgentRuntime {
     /// Silence is a no. An unanswered prompt, a closed stdin or a read error
     /// all decline, because the failure that costs the user something is
     /// writing a file they never agreed to, not refusing one they wanted.
-    fn approve(&self, tool: &str, preview: &str) -> bool {
-        if self.auto_approve {
-            eprintln!("● {tool} {preview}");
+    ///
+    /// A request carrying concerns is always asked, `--yes` or not, so the
+    /// flag cannot blanket-approve the commands most worth reading.
+    fn approve(&self, request: &Approval) -> bool {
+        // A command that names a secret or leaves the project is exactly the
+        // one the user meant to see. `--yes` covers the routine case; it does
+        // not get to cover this one.
+        if self.auto_approve && request.concerns.is_empty() {
+            eprintln!("● {} {}", request.tool, request.preview);
             eprintln!("  approved by --yes");
             return true;
         }
 
-        eprintln!("\n● {tool} {preview}");
+        eprintln!("\n● {} {}", request.tool, request.preview);
+        for concern in request.concerns {
+            eprintln!("  ! {concern}");
+        }
+        if self.auto_approve && !request.concerns.is_empty() {
+            eprintln!("  --yes does not cover this; answer for yourself");
+        }
         eprint!("  apply this change? [y/N] ");
         let _ = std::io::stderr().flush();
 
