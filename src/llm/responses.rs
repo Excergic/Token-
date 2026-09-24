@@ -17,7 +17,7 @@
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{Completion, LlmError, Transport};
+use super::{Completion, LlmError, StreamState, Transport};
 use crate::conversation::{Message, ToolCall};
 use crate::tools::ToolSpec;
 
@@ -44,6 +44,38 @@ impl Transport for OpenAiResponses {
             body["tools"] = tools.iter().map(tool_json).collect();
         }
         body
+    }
+
+    fn on_event(&self, data: &str, state: &mut StreamState) -> Result<Option<String>, LlmError> {
+        let event: StreamEvent = serde_json::from_str(data).map_err(|source| LlmError::Decode {
+            source,
+            body: data.to_string(),
+        })?;
+
+        match event.kind.as_str() {
+            "response.output_text.delta" => {
+                let text = event.delta.unwrap_or_default();
+                state.content.push_str(&text);
+                Ok((!text.is_empty()).then_some(text))
+            }
+            // This wire ends by sending the finished response whole, so the
+            // turn is parsed by the same code a non-streamed one goes
+            // through rather than reassembled from the pieces.
+            "response.completed" | "response.incomplete" | "response.failed" => {
+                let Some(response) = event.response else {
+                    return Ok(None);
+                };
+                state.completion = Some(self.normalize(&response.to_string())?);
+                Ok(None)
+            }
+            // Reasoning summaries, item lifecycle, argument deltas: nothing
+            // the reader can use mid-answer.
+            _ => Ok(None),
+        }
+    }
+
+    fn finish(&self, state: StreamState) -> Result<Completion, LlmError> {
+        state.completion.ok_or(LlmError::EmptyResponse)
     }
 
     fn normalize(&self, body: &str) -> Result<Completion, LlmError> {
@@ -159,6 +191,18 @@ fn finish_reason(status: Option<String>, incomplete: Option<IncompleteDetails>) 
         Some(other) => other.to_string(),
         None => String::new(),
     }
+}
+
+/// One named event from the stream. Only the few fields that matter here are
+/// read; the wire sends many kinds and most are framing.
+#[derive(Deserialize)]
+struct StreamEvent {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    delta: Option<String>,
+    #[serde(default)]
+    response: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -366,6 +410,108 @@ mod tests {
         })
         .to_string();
         assert!(OpenAiResponses.normalize(&body).is_ok());
+    }
+
+    #[test]
+    fn shows_text_deltas_as_they_arrive() {
+        let mut state = StreamState::default();
+        let shown: String = [
+            json!({"type":"response.output_text.delta","delta":"Hel"}),
+            json!({"type":"response.output_text.delta","delta":"lo"}),
+        ]
+        .iter()
+        .filter_map(|event| {
+            OpenAiResponses
+                .on_event(&event.to_string(), &mut state)
+                .unwrap()
+        })
+        .collect();
+        assert_eq!(shown, "Hello");
+    }
+
+    #[test]
+    fn the_finished_turn_comes_from_the_terminal_event() {
+        // This wire sends the completed response whole, so the turn goes
+        // through the same parser a non-streamed one does.
+        let mut state = StreamState::default();
+        let done = json!({
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "output": [{
+                    "id": "fc_1",
+                    "type": "function_call",
+                    "call_id": "call_abc",
+                    "name": "read_file",
+                    "arguments": "{}"
+                }]
+            }
+        });
+        assert!(
+            OpenAiResponses
+                .on_event(&done.to_string(), &mut state)
+                .unwrap()
+                .is_none()
+        );
+        let completion = OpenAiResponses.finish(state).unwrap();
+        assert_eq!(completion.finish_reason, "stop");
+        assert_eq!(
+            completion.message,
+            Message::Assistant {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_abc".into(),
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn a_truncated_stream_reports_length() {
+        let mut state = StreamState::default();
+        let done = json!({
+            "type": "response.incomplete",
+            "response": {
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output": [{"id": "rs_1", "type": "reasoning"}]
+            }
+        });
+        OpenAiResponses
+            .on_event(&done.to_string(), &mut state)
+            .unwrap();
+        assert_eq!(
+            OpenAiResponses.finish(state).unwrap().finish_reason,
+            "length"
+        );
+    }
+
+    #[test]
+    fn framing_events_are_ignored() {
+        let mut state = StreamState::default();
+        for kind in [
+            "response.created",
+            "response.output_item.added",
+            "response.reasoning_summary_text.delta",
+        ] {
+            assert!(
+                OpenAiResponses
+                    .on_event(&json!({"type": kind}).to_string(), &mut state)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn a_stream_that_never_completed_is_an_error() {
+        // Rather than handing back an empty answer as if it were the turn.
+        assert!(matches!(
+            OpenAiResponses.finish(StreamState::default()),
+            Err(LlmError::EmptyResponse)
+        ));
     }
 
     #[test]

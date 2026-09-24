@@ -15,9 +15,10 @@ mod responses;
 
 use reqwest::blocking::{Client, RequestBuilder};
 use serde_json::Value;
+use std::io::{BufRead, BufReader};
 use std::time::Duration;
 
-use crate::conversation::Message;
+use crate::conversation::{Message, ToolCall};
 use crate::tools::ToolSpec;
 
 /// What the model returned, plus why it stopped. `finish_reason` is the only
@@ -40,6 +41,76 @@ pub enum LlmError {
     },
     #[error("api returned no output")]
     EmptyResponse,
+    #[error("the stream ended badly: {0}")]
+    Stream(std::io::Error),
+}
+
+/// A tool call as it arrives in pieces. The chat wire sends a call's name and
+/// its arguments across several chunks, keyed by position rather than by id,
+/// so they are merged here before becoming a `ToolCall`.
+#[derive(Default, Clone)]
+pub struct PartialToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+/// What a transport has gathered so far. One turn's worth; each transport
+/// fills the parts its wire actually sends.
+#[derive(Default)]
+pub struct StreamState {
+    pub content: String,
+    pub tool_calls: Vec<PartialToolCall>,
+    pub finish_reason: String,
+    /// Set by a wire that delivers the finished turn whole, rather than
+    /// leaving it to be reassembled from deltas.
+    pub completion: Option<Completion>,
+}
+
+impl StreamState {
+    /// Merge a piece of a tool call arriving at `index`.
+    pub fn merge_tool_call(
+        &mut self,
+        index: usize,
+        id: Option<&str>,
+        name: Option<&str>,
+        arguments: Option<&str>,
+    ) {
+        if self.tool_calls.len() <= index {
+            self.tool_calls
+                .resize(index + 1, PartialToolCall::default());
+        }
+        let call = &mut self.tool_calls[index];
+        if let Some(id) = id {
+            call.id.push_str(id);
+        }
+        if let Some(name) = name {
+            call.name.push_str(name);
+        }
+        if let Some(arguments) = arguments {
+            call.arguments.push_str(arguments);
+        }
+    }
+
+    /// The assembled turn, for a wire that sends only deltas.
+    pub fn into_completion(self) -> Completion {
+        Completion {
+            message: Message::Assistant {
+                content: (!self.content.is_empty()).then_some(self.content),
+                tool_calls: self
+                    .tool_calls
+                    .into_iter()
+                    .filter(|call| !call.name.is_empty())
+                    .map(|call| ToolCall {
+                        id: call.id,
+                        name: call.name,
+                        arguments: call.arguments,
+                    })
+                    .collect(),
+            },
+            finish_reason: self.finish_reason,
+        }
+    }
 }
 
 /// A provider, only as far as its defaults go. Which wire format it speaks is
@@ -131,16 +202,23 @@ fn host_of(base_url: &str) -> &str {
 /// One wire format. Both halves are pure so they can be tested on fixtures:
 /// `request` renders our types, `normalize` reads the provider's reply back
 /// into them. Whatever came in, the runtime always gets a `Completion`.
-trait Transport {
+trait Transport: Send {
     /// Path appended to the base URL.
     fn path(&self) -> &'static str;
 
     fn request(&self, model: &str, messages: &[Message], tools: &[ToolSpec]) -> Value;
 
     fn normalize(&self, body: &str) -> Result<Completion, LlmError>;
+
+    /// Interpret one SSE payload. Returns text to show the user now, if this
+    /// event carried any.
+    fn on_event(&self, data: &str, state: &mut StreamState) -> Result<Option<String>, LlmError>;
+
+    /// The finished turn, once the stream has ended.
+    fn finish(&self, state: StreamState) -> Result<Completion, LlmError>;
 }
 
-fn transport_for(mode: ApiMode) -> Box<dyn Transport> {
+fn transport_for(mode: ApiMode) -> Box<dyn Transport + Send> {
     match mode {
         ApiMode::ChatCompletions => Box::new(chat::ChatCompletions),
         ApiMode::OpenAiResponses => Box::new(responses::OpenAiResponses),
@@ -149,13 +227,17 @@ fn transport_for(mode: ApiMode) -> Box<dyn Transport> {
 
 /// Stateless. Holds no conversation: the runtime owns that and passes the
 /// whole transcript every call, whichever provider is behind this.
+/// How long a streamed answer may take in total. Generous on purpose: the
+/// 60s that suits a single request is an answer's worth of time here.
+const STREAM_TIMEOUT: Duration = Duration::from_secs(600);
+
 pub struct LlmClient {
     http: Client,
     base_url: String,
     api_key: String,
     model: String,
     auth: Auth,
-    transport: Box<dyn Transport>,
+    transport: Box<dyn Transport + Send>,
 }
 
 impl LlmClient {
@@ -208,6 +290,65 @@ impl LlmClient {
     /// The model these requests name, for anything that records a run.
     pub fn model(&self) -> &str {
         &self.model
+    }
+
+    /// Like `send`, but hands each piece of text to `on_delta` as it arrives.
+    ///
+    /// The transcript still comes back as one `Completion`, so the runtime is
+    /// unchanged: streaming is about when the user sees the answer, not about
+    /// who owns the conversation.
+    pub fn send_streaming(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<Completion, LlmError> {
+        let mut body = self.transport.request(&self.model, messages, tools);
+        body["stream"] = Value::Bool(true);
+        let url = format!(
+            "{}{}",
+            self.base_url.trim_end_matches('/'),
+            self.transport.path()
+        );
+
+        let response = self
+            .authorise(self.http.post(url))
+            // The client's timeout covers a whole request, and a whole
+            // request here is the length of an answer. A long one must not
+            // be cut off at the deadline meant for a short one.
+            .timeout(STREAM_TIMEOUT)
+            .json(&body)
+            .send()?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().unwrap_or_default();
+            return Err(LlmError::Api {
+                status: status.as_u16(),
+                body,
+            });
+        }
+
+        let mut state = StreamState::default();
+        for line in BufReader::new(response).lines() {
+            let line = line.map_err(LlmError::Stream)?;
+            // Server-sent events: `data:` carries the payload, everything
+            // else is framing (`event:`, comments, blank separators).
+            let Some(payload) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let payload = payload.trim();
+            // `[DONE]` closes a chat stream; the Responses wire has no
+            // sentinel and ends with a terminal event instead.
+            if payload.is_empty() || payload == "[DONE]" {
+                continue;
+            }
+            if let Some(text) = self.transport.on_event(payload, &mut state)? {
+                on_delta(&text);
+            }
+        }
+
+        self.transport.finish(state)
     }
 
     fn authorise(&self, request: RequestBuilder) -> RequestBuilder {
