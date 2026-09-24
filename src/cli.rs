@@ -2,6 +2,7 @@ use clap::Parser;
 use std::path::PathBuf;
 
 use crate::llm::{ApiMode, Provider};
+use crate::sandbox::SandboxMode;
 use crate::tools::{DEFAULT_EXEC_TIMEOUT_SECS, DEFAULT_MAX_TOOL_OUTPUT_BYTES};
 
 /// A CLI coding agent. Talks to OpenAI by default; `--provider sarvam` and any
@@ -42,6 +43,16 @@ pub struct Cli {
     /// set the model is not given it at all, rather than refused on use.
     #[arg(long)]
     pub no_exec: bool,
+
+    /// How much a command is allowed to do. `workspace-write` confines writes
+    /// to the project; `read-only` forbids them; `off` removes the sandbox.
+    #[arg(long, value_enum, default_value_t = SandboxMode::WorkspaceWrite)]
+    pub sandbox: SandboxMode,
+
+    /// Let sandboxed commands reach the network. Denied by default: the
+    /// network is how anything the agent read leaves the machine.
+    #[arg(long)]
+    pub allow_network: bool,
 
     /// Seconds a command may run before it is killed
     #[arg(long, value_name = "SECS", default_value_t = DEFAULT_EXEC_TIMEOUT_SECS)]

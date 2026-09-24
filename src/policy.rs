@@ -116,9 +116,20 @@ pub fn committed_secret(content: &str) -> Option<String> {
     None
 }
 
+/// Paths that are outside the project but carry nothing and hide nothing.
+/// Flagging `> /dev/null` would put a warning on half the commands a shell
+/// runs, and a warning on everything is one nobody reads.
+const HARMLESS_PATHS: [&str; 5] = [
+    "/dev/null",
+    "/dev/stdout",
+    "/dev/stderr",
+    "/dev/zero",
+    "/dev/tty",
+];
+
 /// What about a shell command deserves a second look, in the user's words.
 ///
-/// `run_command` is a shell: it drives straight around the path handling that
+/// `terminal` is a shell: it drives straight around the path handling that
 /// `read_file` and `write_file` enforce, and `rm .env` is not a write the
 /// registry can refuse. This reads the command text and names what it sees,
 /// so the approval prompt can say why it is worth reading carefully.
@@ -139,6 +150,9 @@ pub fn command_concerns(command: &str, root: &Path) -> Vec<String> {
     for token in path_like_tokens(command) {
         // A flag is not a path. `-rf` should not be mistaken for one.
         if token.starts_with('-') {
+            continue;
+        }
+        if HARMLESS_PATHS.contains(&token.as_str()) {
             continue;
         }
         let path = Path::new(&token);
@@ -446,6 +460,15 @@ mod tests {
         assert!(concerns("grep -rn TODO .").is_empty());
         assert!(concerns("rustc hello.rs -o hello && ./hello").is_empty());
         assert!(concerns("rm -rf target").is_empty());
+    }
+
+    #[test]
+    fn the_usual_devices_are_not_flagged() {
+        // Seen live: `> /dev/null` was flagged as leaving the project, which
+        // is true and useless. Noise here costs the warnings their meaning.
+        assert!(concerns("curl -s -o /dev/null https://example.com").is_empty());
+        assert!(concerns("cargo test 2> /dev/null").is_empty());
+        assert!(concerns("echo hi > /dev/stderr").is_empty());
     }
 
     #[test]
