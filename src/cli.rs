@@ -10,8 +10,9 @@ use crate::tools::{DEFAULT_EXEC_TIMEOUT_SECS, DEFAULT_MAX_TOOL_OUTPUT_BYTES};
 #[derive(Parser, Debug)]
 #[command(name = "token", version, about)]
 pub struct Cli {
-    /// The task to hand to the agent
-    #[arg(required = true, num_args = 1.., value_name = "TASK")]
+    /// The task to hand to the agent. Optional when `--tui` opens the screen
+    /// with an empty composer.
+    #[arg(required_unless_present = "tui", num_args = 1.., value_name = "TASK")]
     task: Vec<String>,
 
     /// Which provider to talk to. Sets the default base URL, model and key.
@@ -70,6 +71,10 @@ pub struct Cli {
     /// Do not read or write session history for this run
     #[arg(long, conflicts_with = "resume")]
     pub no_session: bool,
+
+    /// Open the interactive screen instead of printing one answer and exiting.
+    #[arg(long)]
+    pub tui: bool,
 
     /// Session database (default: ~/.token/sessions.db)
     #[arg(long, value_name = "PATH")]

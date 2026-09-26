@@ -18,11 +18,11 @@ use std::path::{Path, PathBuf};
 pub enum SandboxMode {
     /// No confinement. The command can do anything the user can.
     Off,
-    /// No writes anywhere, no network. Enough to build nothing and inspect
-    /// everything.
+    /// No writes anywhere. Remote network denied; loopback stays open.
+    /// Enough to build nothing and inspect everything.
     ReadOnly,
     /// Writes confined to the project and the temporary directories a
-    /// toolchain needs. No network.
+    /// toolchain needs. Remote network denied; loopback stays open.
     WorkspaceWrite,
 }
 
@@ -167,9 +167,18 @@ fn seatbelt_policy(policy: &SandboxPolicy) -> String {
         ));
     }
 
+    // Remote network is how a read leaves the machine, so it stays denied
+    // unless the user asked. Loopback is carved back in afterwards: a later
+    // rule wins, and binding 127.0.0.1 does not leave the machine. Seatbelt's
+    // `localhost` covers 127.0.0.1 and ::1.
     rules.push_str(match policy.allow_network {
         true => "(allow network*)\n",
-        false => "(deny network*)\n",
+        false => {
+            "(deny network*)\n\
+             (allow network-bind (local ip \"localhost:*\"))\n\
+             (allow network-inbound (local ip \"localhost:*\"))\n\
+             (allow network-outbound (remote ip \"localhost:*\"))\n"
+        }
     });
     rules
 }
@@ -258,10 +267,32 @@ mod tests {
 
     #[test]
     fn network_is_denied_unless_asked_for() {
-        assert!(rendered(SandboxMode::WorkspaceWrite).contains("(deny network*)"));
+        let rules = rendered(SandboxMode::WorkspaceWrite);
+        assert!(rules.contains("(deny network*)"));
+        assert!(!rules.contains("(allow network*)\n"));
 
         let allowed = SandboxPolicy::new(SandboxMode::WorkspaceWrite, Path::new("/project"), true);
-        assert!(seatbelt_policy(&allowed).contains("(allow network*)"));
+        let open = seatbelt_policy(&allowed);
+        assert!(open.contains("(allow network*)"));
+        assert!(!open.contains("(deny network*)"));
+    }
+
+    #[test]
+    fn loopback_stays_open_when_the_remote_network_is_denied() {
+        let rules = rendered(SandboxMode::ReadOnly);
+        let denied = rules
+            .find("(deny network*)")
+            .expect("remote network denied");
+        for allow in [
+            "(allow network-bind (local ip \"localhost:*\"))",
+            "(allow network-inbound (local ip \"localhost:*\"))",
+            "(allow network-outbound (remote ip \"localhost:*\"))",
+        ] {
+            let at = rules
+                .find(allow)
+                .unwrap_or_else(|| panic!("missing {allow} in {rules}"));
+            assert!(at > denied, "{allow} must follow the denial so it wins");
+        }
     }
 
     #[test]

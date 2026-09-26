@@ -7,6 +7,7 @@ mod sandbox;
 mod secrets;
 mod session;
 mod tools;
+mod tui;
 
 use clap::Parser;
 use std::error::Error;
@@ -25,7 +26,11 @@ fn main() {
     let _ = dotenvy::dotenv();
 
     match run(&Cli::parse()) {
-        Ok(response) => println!("{response}"),
+        Ok(response) => {
+            if !response.is_empty() {
+                println!("{response}");
+            }
+        }
         Err(err) => {
             eprintln!("error: {err}");
             process::exit(1);
@@ -56,6 +61,28 @@ fn run(cli: &Cli) -> Result<String, Box<dyn Error>> {
     }
     if !cli.no_session {
         runtime = runtime.with_sessions(SessionStore::open(&cli.session_db())?, cli.resume);
+    }
+
+    if cli.tui {
+        let task = cli.task();
+        let first = match task.is_empty() {
+            true => None,
+            false => Some(task),
+        };
+        tui::launch(
+            runtime,
+            tui::SessionMeta {
+                model: cli.model(),
+                sandbox: match cli.sandbox {
+                    sandbox::SandboxMode::Off => "off",
+                    sandbox::SandboxMode::ReadOnly => "read-only",
+                    sandbox::SandboxMode::WorkspaceWrite => "workspace-write",
+                }
+                .to_string(),
+            },
+            first,
+        )?;
+        return Ok(String::new());
     }
 
     Ok(runtime.run(&cli.task())?)

@@ -1,5 +1,7 @@
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::conversation::{Conversation, Message};
@@ -37,6 +39,8 @@ pub enum RuntimeError {
     TurnLimit,
     #[error("model kept writing fake tool markup instead of calling a tool")]
     FakeToolCalls,
+    #[error("interrupted")]
+    Cancelled,
     #[error("no session to resume in {0}; run a task here first")]
     NoSessionToResume(String),
     #[error(transparent)]
@@ -56,6 +60,56 @@ pub struct AgentRuntime {
     sessions: Option<SessionStore>,
     resume: bool,
     auto_approve: bool,
+    /// Set by the TUI. The one-shot CLI leaves this empty and keeps writing
+    /// the trace to stderr.
+    sink: Option<Box<dyn TurnSink>>,
+    /// Shared with the screen so Esc can stop the loop between tools.
+    cancel: Arc<AtomicBool>,
+}
+
+/// What the screen needs while a turn is in flight. The runtime does not draw.
+#[derive(Debug)]
+pub enum TurnEvent {
+    /// A model call has started and nothing has come back yet.
+    Thinking,
+    /// A piece of the answer, as it arrives. The whole answer still follows
+    /// as `Assistant`, so anything that only handles that stays correct.
+    Delta(String),
+    Assistant(String),
+    ToolStart {
+        name: String,
+        arguments: String,
+    },
+    ToolDone {
+        name: String,
+        output: String,
+        failed: bool,
+    },
+}
+
+/// The approval question, owned so it can cross a thread.
+#[derive(Debug)]
+pub struct ApprovalRequest {
+    pub tool: String,
+    pub preview: String,
+    pub concerns: Vec<String>,
+    pub flagged: bool,
+}
+
+/// Where a turn reports progress. Present only for the TUI; the CLI does not
+/// set one. Methods take `&self` because `run` is shared and the sink blocks
+/// inside `choose` until the screen answers.
+pub trait TurnSink: Send {
+    fn emit(&self, event: TurnEvent);
+    fn choose(&self, request: ApprovalRequest) -> ApprovalChoice;
+}
+
+/// What the user said at the approval prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalChoice {
+    Once,
+    Always,
+    No,
 }
 
 impl AgentRuntime {
@@ -67,6 +121,28 @@ impl AgentRuntime {
             sessions: None,
             resume: false,
             auto_approve: false,
+            sink: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Draw progress on a screen instead of stderr. The one-shot CLI never
+    /// calls this.
+    pub fn with_sink(mut self, sink: Box<dyn TurnSink>) -> Self {
+        self.sink = Some(sink);
+        self
+    }
+
+    /// Handle the screen holds so it can interrupt a turn it does not own.
+    pub fn cancel_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancel)
+    }
+
+    /// The next `run` continues this directory's session. The TUI sets this
+    /// after the first turn so the model sees the chat already on screen.
+    pub fn resume_next(&mut self) {
+        if self.sessions.is_some() {
+            self.resume = true;
         }
     }
 
@@ -118,9 +194,25 @@ impl AgentRuntime {
         // consent dies with the process and is never written down.
         let mut allow_all = false;
 
+        // A cancel from the previous turn must not kill this one.
+        self.cancel.store(false, Ordering::Relaxed);
+
         let mut corrections = 0;
         for _ in 0..MAX_TURNS {
-            let completion = self.llm.send(conversation.messages(), &specs)?;
+            if self.cancelled() {
+                return Err(RuntimeError::Cancelled);
+            }
+            self.note_thinking();
+            // Streaming only earns its keep where someone is watching. The
+            // CLI prints one answer at the end, so it takes the simpler path.
+            let completion = match self.sink.is_some() {
+                true => {
+                    let mut on_delta = |text: &str| self.emit(TurnEvent::Delta(text.to_string()));
+                    self.llm
+                        .send_streaming(conversation.messages(), &specs, &mut on_delta)?
+                }
+                false => self.llm.send(conversation.messages(), &specs)?,
+            };
             self.record(&mut conversation, &session, completion.message.clone())?;
 
             let Message::Assistant {
@@ -130,6 +222,10 @@ impl AgentRuntime {
             else {
                 return Err(RuntimeError::EmptyAnswer(completion.finish_reason));
             };
+
+            if let Some(text) = content.as_ref().filter(|text| !text.trim().is_empty()) {
+                self.emit(TurnEvent::Assistant(text.clone()));
+            }
 
             if tool_calls.is_empty() {
                 let text = content.unwrap_or_default();
@@ -141,7 +237,7 @@ impl AgentRuntime {
                     if corrections > MAX_CORRECTIONS {
                         return Err(RuntimeError::FakeToolCalls);
                     }
-                    eprintln!("✗ ignored invented tool call in message text");
+                    self.trace("✗ ignored invented tool call in message text");
                     conversation.push(Message::User(format!(
                         "{CORRECTION}{}.",
                         self.tools.names()
@@ -158,7 +254,14 @@ impl AgentRuntime {
             // Run every requested tool and feed each result back. A failure is
             // reported to the model, not to the user: it can correct itself.
             for call in tool_calls {
-                eprintln!("→ {} {}", call.name, call.arguments);
+                if self.cancelled() {
+                    return Err(RuntimeError::Cancelled);
+                }
+                self.emit(TurnEvent::ToolStart {
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                });
+                self.trace(&format!("→ {} {}", call.name, call.arguments));
                 let mut approve = |request: &Approval| self.approve(request, &mut allow_all);
                 let result =
                     match self
@@ -167,17 +270,21 @@ impl AgentRuntime {
                     {
                         Ok(output) => output,
                         Err(err) => {
-                            eprintln!("  ✗ {err}");
+                            self.trace(&format!("  ✗ {err}"));
                             format!("error: {err}")
                         }
                     };
+                let failed = result.starts_with("error:");
                 // Before the model sees it, and so before it is sent to the
                 // provider on every later turn. `policy.rs` refuses the files
                 // it can name; this catches a credential sitting inside one
                 // it cannot, such as a config file or a log.
                 let result = secrets::redact(&result);
                 if result.count > 0 {
-                    eprintln!("  ✗ redacted {} secret(s) from the result", result.count);
+                    self.trace(&format!(
+                        "  ✗ redacted {} secret(s) from the result",
+                        result.count
+                    ));
                 }
 
                 // A tool may legitimately produce nothing: an empty file, a
@@ -185,6 +292,11 @@ impl AgentRuntime {
                 // Sarvam rejects an empty tool message with a 400 - so say so
                 // in words instead of sending the emptiness.
                 let content = tool_content(result.text);
+                self.emit(TurnEvent::ToolDone {
+                    name: call.name,
+                    output: content.clone(),
+                    failed,
+                });
 
                 self.record(
                     &mut conversation,
@@ -210,15 +322,26 @@ impl AgentRuntime {
     /// flag cannot blanket-approve the commands most worth reading.
     fn approve(&self, request: &Approval, allow_all: &mut bool) -> bool {
         if !needs_asking(request, self.auto_approve, *allow_all) {
-            eprintln!("● {} {}", request.tool, request.preview);
-            eprintln!(
+            self.trace(&format!("● {} {}", request.tool, request.preview));
+            self.trace(&format!(
                 "  approved by {}",
                 match self.auto_approve {
                     true => "--yes",
                     false => "Allow Always",
                 }
-            );
+            ));
             return true;
+        }
+
+        let flagged = !request.concerns.is_empty();
+        if let Some(sink) = &self.sink {
+            let choice = sink.choose(ApprovalRequest {
+                tool: request.tool.to_string(),
+                preview: request.preview.to_string(),
+                concerns: request.concerns.to_vec(),
+                flagged,
+            });
+            return self.apply_choice(choice, flagged, allow_all);
         }
 
         eprintln!("\n● {} {}", request.tool, request.preview);
@@ -229,7 +352,6 @@ impl AgentRuntime {
         // A flagged call is asked every time, so "Allow Always" cannot be
         // honoured here. The option keeps its number rather than vanishing:
         // a menu that changes shape between prompts is one people misread.
-        let flagged = !request.concerns.is_empty();
         eprintln!();
         eprintln!("  1) Allow Once");
         match flagged {
@@ -250,24 +372,52 @@ impl AgentRuntime {
                 if !std::io::stdin().is_terminal() {
                     eprintln!("(no answer; declined)");
                 }
-                Decision::No
+                ApprovalChoice::No
             }
             Ok(_) => decide(&answer),
         };
 
+        let allowed = self.apply_choice(decision, flagged, allow_all);
         match decision {
-            Decision::Always if !flagged => {
-                *allow_all = true;
+            ApprovalChoice::Always if !flagged && allowed => {
                 eprintln!("  ✓ every change approved for the rest of this session");
+            }
+            ApprovalChoice::No => eprintln!("  ✗ declined"),
+            _ => {}
+        }
+        allowed
+    }
+
+    fn apply_choice(&self, choice: ApprovalChoice, flagged: bool, allow_all: &mut bool) -> bool {
+        match choice {
+            ApprovalChoice::Always if !flagged => {
+                *allow_all = true;
                 true
             }
-            // "Allow Always" on a flagged call is taken as Allow Once: this
-            // one proceeds, the next is still asked.
-            Decision::Always | Decision::Once => true,
-            Decision::No => {
-                eprintln!("  ✗ declined");
-                false
-            }
+            ApprovalChoice::Always | ApprovalChoice::Once => true,
+            ApprovalChoice::No => false,
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+
+    fn emit(&self, event: TurnEvent) {
+        if let Some(sink) = &self.sink {
+            sink.emit(event);
+        }
+    }
+
+    fn note_thinking(&self) {
+        self.emit(TurnEvent::Thinking);
+    }
+
+    /// Stderr when nobody is drawing. A sink already has the structured events,
+    /// and a line on stderr would land on top of the screen.
+    fn trace(&self, line: &str) {
+        if self.sink.is_none() {
+            eprintln!("{line}");
         }
     }
 
@@ -337,24 +487,16 @@ fn tool_content(text: String) -> String {
     }
 }
 
-/// What the user said at the prompt.
-#[derive(Debug, PartialEq)]
-enum Decision {
-    Once,
-    Always,
-    No,
-}
-
 /// Read the answer. The menu is numbered, but the words it prints are
 /// accepted too, because someone reading "Allow Once" will type it.
 ///
 /// Anything unrecognised is a no: the costly mistake is acting on consent the
 /// user did not give, so a typo declines rather than guessing.
-fn decide(answer: &str) -> Decision {
+fn decide(answer: &str) -> ApprovalChoice {
     match answer.trim().to_ascii_lowercase().as_str() {
-        "1" | "once" | "allow once" | "y" | "yes" => Decision::Once,
-        "2" | "always" | "allow always" | "a" => Decision::Always,
-        _ => Decision::No,
+        "1" | "once" | "allow once" | "y" | "yes" => ApprovalChoice::Once,
+        "2" | "always" | "allow always" | "a" => ApprovalChoice::Always,
+        _ => ApprovalChoice::No,
     }
 }
 
@@ -415,29 +557,29 @@ mod tests {
 
     #[test]
     fn reads_the_numbered_answers() {
-        assert_eq!(decide("1"), Decision::Once);
-        assert_eq!(decide("2"), Decision::Always);
-        assert_eq!(decide("3"), Decision::No);
+        assert_eq!(decide("1"), ApprovalChoice::Once);
+        assert_eq!(decide("2"), ApprovalChoice::Always);
+        assert_eq!(decide("3"), ApprovalChoice::No);
     }
 
     #[test]
     fn reads_the_words_the_menu_prints() {
         // Someone shown "Allow Once" will type it rather than its number.
-        assert_eq!(decide("once"), Decision::Once);
-        assert_eq!(decide("Allow Once"), Decision::Once);
-        assert_eq!(decide("always"), Decision::Always);
-        assert_eq!(decide(" ALLOW ALWAYS \n"), Decision::Always);
-        assert_eq!(decide("no"), Decision::No);
+        assert_eq!(decide("once"), ApprovalChoice::Once);
+        assert_eq!(decide("Allow Once"), ApprovalChoice::Once);
+        assert_eq!(decide("always"), ApprovalChoice::Always);
+        assert_eq!(decide(" ALLOW ALWAYS \n"), ApprovalChoice::Always);
+        assert_eq!(decide("no"), ApprovalChoice::No);
     }
 
     #[test]
     fn anything_unrecognised_declines() {
         // A typo must not be read as consent.
-        assert_eq!(decide(""), Decision::No);
-        assert_eq!(decide("\n"), Decision::No);
-        assert_eq!(decide("4"), Decision::No);
-        assert_eq!(decide("yolo"), Decision::No);
-        assert_eq!(decide("allow"), Decision::No);
+        assert_eq!(decide(""), ApprovalChoice::No);
+        assert_eq!(decide("\n"), ApprovalChoice::No);
+        assert_eq!(decide("4"), ApprovalChoice::No);
+        assert_eq!(decide("yolo"), ApprovalChoice::No);
+        assert_eq!(decide("allow"), ApprovalChoice::No);
     }
 
     #[test]

@@ -109,7 +109,7 @@ pub struct Approval<'a> {
 
 /// A tool the model can call. One implementation carries both the schema the
 /// model sees and the code that runs, so the two cannot drift apart.
-pub trait Tool {
+pub trait Tool: Send {
     fn name(&self) -> &'static str;
     fn spec(&self) -> ToolSpec;
     fn call(&self, arguments: &str, root: &Path) -> Result<String, ToolError>;
@@ -137,7 +137,7 @@ pub trait Tool {
 /// Every tool that exists. The model-visible list and dispatch both read from
 /// here, so anything the model can see is callable and anything else is not.
 pub struct Registry {
-    tools: Vec<Box<dyn Tool>>,
+    tools: Vec<Box<dyn Tool + Send>>,
     max_output_bytes: usize,
 }
 

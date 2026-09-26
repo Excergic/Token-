@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::{Completion, LlmError, Transport};
+use super::{Completion, LlmError, StreamState, Transport};
 use crate::conversation::{Message, ToolCall};
 use crate::tools::ToolSpec;
 
@@ -30,6 +30,52 @@ impl Transport for ChatCompletions {
         body
     }
 
+    fn on_event(&self, data: &str, state: &mut StreamState) -> Result<Option<String>, LlmError> {
+        let chunk: Chunk = serde_json::from_str(data).map_err(|source| LlmError::Decode {
+            source,
+            body: data.to_string(),
+        })?;
+        let Some(choice) = chunk.choices.into_iter().next() else {
+            return Ok(None);
+        };
+        if let Some(reason) = choice.finish_reason {
+            state.finish_reason = reason;
+        }
+        let Some(delta) = choice.delta else {
+            return Ok(None);
+        };
+
+        for call in delta.tool_calls.unwrap_or_default() {
+            let function = call.function.unwrap_or(ChunkFunction {
+                name: None,
+                arguments: None,
+            });
+            state.merge_tool_call(
+                call.index,
+                call.id.as_deref(),
+                function.name.as_deref(),
+                function.arguments.as_deref(),
+            );
+        }
+
+        // Only text is shown as it arrives. A half-built tool call is not
+        // something the user can read, and showing it would put JSON in the
+        // middle of an answer.
+        Ok(match delta.content {
+            Some(text) if !text.is_empty() => {
+                state.content.push_str(&text);
+                Some(text)
+            }
+            _ => None,
+        })
+    }
+
+    fn finish(&self, state: StreamState) -> Result<Completion, LlmError> {
+        // This wire sends nothing but deltas, so the turn is whatever they
+        // added up to.
+        Ok(state.into_completion())
+    }
+
     fn normalize(&self, body: &str) -> Result<Completion, LlmError> {
         let parsed: ChatResponse =
             serde_json::from_str(body).map_err(|source| LlmError::Decode {
@@ -46,6 +92,49 @@ impl Transport for ChatCompletions {
             })
             .ok_or(LlmError::EmptyResponse)
     }
+}
+
+/// Chunks carry a fragment of one choice. Content and tool calls arrive as
+/// separate slivers, and a tool call is keyed by `index` rather than by id -
+/// the id itself is sent in pieces too - so position is what joins them.
+#[derive(Deserialize)]
+struct Chunk {
+    #[serde(default)]
+    choices: Vec<ChunkChoice>,
+}
+
+#[derive(Deserialize)]
+struct ChunkChoice {
+    #[serde(default)]
+    delta: Option<ChunkDelta>,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct ChunkDelta {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ChunkToolCall>>,
+}
+
+#[derive(Deserialize)]
+struct ChunkToolCall {
+    #[serde(default)]
+    index: usize,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<ChunkFunction>,
+}
+
+#[derive(Deserialize)]
+struct ChunkFunction {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
 }
 
 /// This wire nests the function under a `function` key. The Responses wire
@@ -305,6 +394,87 @@ mod tests {
                     arguments: "{}".into(),
                 }],
             }
+        );
+    }
+
+    fn feed(chunks: &[Value]) -> (String, Completion) {
+        let mut state = StreamState::default();
+        let mut shown = String::new();
+        for chunk in chunks {
+            if let Some(text) = ChatCompletions
+                .on_event(&chunk.to_string(), &mut state)
+                .unwrap()
+            {
+                shown.push_str(&text);
+            }
+        }
+        (shown, ChatCompletions.finish(state).unwrap())
+    }
+
+    #[test]
+    fn assembles_text_from_deltas() {
+        let (shown, completion) = feed(&[
+            json!({"choices":[{"delta":{"content":"Hel"}}]}),
+            json!({"choices":[{"delta":{"content":"lo"}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+        ]);
+        assert_eq!(shown, "Hello");
+        assert_eq!(completion.finish_reason, "stop");
+        assert_eq!(
+            completion.message,
+            Message::Assistant {
+                content: Some("Hello".into()),
+                tool_calls: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn assembles_a_tool_call_split_across_chunks() {
+        // The id, the name and the arguments all arrive in pieces, keyed by
+        // index rather than by id, so position is what joins them.
+        let (shown, completion) = feed(&[
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-","function":{"name":"read_"}}]}}]}),
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"1","function":{"name":"file","arguments":"{\"path\":"}}]}}]}),
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a.rs\"}"}}]}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+        ]);
+        assert!(shown.is_empty(), "a half-built call must not be shown");
+        assert_eq!(
+            completion.message,
+            Message::Assistant {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "call-1".into(),
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"a.rs"}"#.into(),
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn assembles_two_parallel_tool_calls() {
+        let (_, completion) = feed(&[
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"read_file","arguments":"{}"}}]}}]}),
+            json!({"choices":[{"delta":{"tool_calls":[{"index":1,"id":"b","function":{"name":"terminal","arguments":"{}"}}]}}]}),
+        ]);
+        let Message::Assistant { tool_calls, .. } = completion.message else {
+            panic!("expected an assistant turn");
+        };
+        assert_eq!(tool_calls.len(), 2);
+        assert_eq!(tool_calls[1].name, "terminal");
+    }
+
+    #[test]
+    fn a_chunk_with_no_choices_is_not_an_error() {
+        // Some providers open a stream with a metadata-only chunk.
+        let mut state = StreamState::default();
+        assert!(
+            ChatCompletions
+                .on_event(&json!({"choices":[]}).to_string(), &mut state)
+                .unwrap()
+                .is_none()
         );
     }
 

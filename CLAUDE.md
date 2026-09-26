@@ -17,6 +17,7 @@ cargo run -- --resume "And what calls it?"            # continue this directory
 cargo run -- "Run the tests and tell me what fails"  # asks before each command
 cargo run -- --no-exec "Explain src/runtime.rs"      # no shell tool at all
 cargo run -- --sandbox off --allow-network "..."     # unconfined, network on
+cargo run -- --tui                                   # interactive screen
 cargo test
 ```
 
@@ -174,9 +175,10 @@ transcript can be inspected, truncated or replayed later.
   `policy.rs` reads a command's text and a quoted or variable-built path walks
   past it. `sandbox.rs` asks the kernel, so `cat ".e""nv"` fails whatever it
   looks like. Modes: `workspace-write` (default) confines writes to the project
-  and TMPDIR, `read-only` forbids writes, `off` removes it. Network is denied
-  unless `--allow-network`, because the network is how anything the agent read
-  leaves the machine.
+  and TMPDIR, `read-only` forbids writes, `off` removes it. Remote network is
+  denied unless `--allow-network`, because the network is how anything the
+  agent read leaves the machine. Loopback stays open either way, so a command
+  can bind and call `127.0.0.1` without a path off the machine.
 - **A sandbox that breaks the toolchain gets switched off, and one that is off
   protects nothing.** Reads stay broadly allowed - a compiler needs the SDK and
   half of `/usr` - and only credentials are denied. `.git` stays readable here
@@ -196,6 +198,27 @@ transcript can be inspected, truncated or replayed later.
 - **A tool result is never empty on the wire.** An empty file or a silent
   command produces no output, and at least one provider rejects an empty tool
   message with a 400 that ends the run. The runtime substitutes words.
+- **Streaming is about when the user sees an answer, not who owns it.**
+  `send_streaming` hands each piece of text to a callback and still returns one
+  `Completion`, so the runtime, the conversation and the session are unchanged.
+  It is used only when a `TurnSink` is present: the CLI prints one answer at
+  the end and takes the simpler path.
+- **Each wire reassembles its own stream.** The chat wire sends nothing but
+  deltas, so the turn is whatever they add up to - and a tool call arrives in
+  pieces keyed by `index`, with the id itself split across chunks, so position
+  is what joins them. The Responses wire ends by sending the finished response
+  whole, so `response.completed` goes through the same `normalize` a
+  non-streamed turn does rather than being rebuilt from fragments.
+- **Only text is streamed to the screen.** A half-built tool call is not
+  something anyone can read, and showing it would put JSON in the middle of an
+  answer. The TUI renders streamed text plain and lets the finished cell do the
+  markdown: re-laying out on every delta reflows tables and code blocks as they
+  grow, which reads worse than waiting.
+- **Null is not absence on this wire either.** Sarvam sends `"content": null`
+  and `"tool_calls": null` in most chunks, and closes with a usage-only chunk
+  whose `choices` is empty, then `[DONE]`. `Option` fields handle that; a
+  defaulted `Vec` would not, which is the trap the non-streaming client already
+  fell into once.
 - **A non-zero exit is an answer, not a tool failure.** A failing `cargo test`
   is what the model asked to see, so the status and output come back as a
   result. Only a timeout or a failure to spawn is an error.
@@ -224,6 +247,81 @@ agent (`sandbox-exec` cannot nest, so the suite's sandbox tests fail inside the
 agent's sandbox: use `--sandbox off` for that one case); a persistent kernel, so nothing carries between
 commands and each starts fresh; Windows support for `terminal` (it assumes
 `/bin/sh` and POSIX process groups); a configurable turn limit (`MAX_TURNS` is 10, and a 12-file task exhausts it).
+
+## Capability map
+
+The paths below are this crate's modules. A Codex-shaped tree (`core/src/`,
+`tui/src/`) is not the layout, and these layers stay separate.
+
+| Area | Where it lives | State |
+|---|---|---|
+| Turn loop | `runtime.rs` `run` | Done. Observe and act through tool calls. No separate plan step. `MAX_TURNS` is 10 and the stop message does not say what already happened. |
+| Tool routing | `tools.rs` `Registry` | Done for `read_file`, `write_file`, `terminal`. Missing `list_files`, `grep`, `apply_patch`. A failed tool result already goes back to the model, which is the self-correction that exists today. |
+| Context building | `runtime.rs` system prompt, `conversation.rs` | History and the system prompt only. No assembled file contents, diagnostics, or repo map. |
+| Context window | `--max-tool-output` in `runtime.rs` | Per-tool truncation only. No token budget and no priority-based inclusion. |
+| Session persistence | `session.rs` | Write-through SQLite, `--resume` by cwd, repair of a killed mid-loop transcript. No named session, list, or search. Nothing prunes history. |
+| Model client | `llm/` | OpenAI chat, OpenAI Responses, Sarvam via the same transports. No Anthropic, no streaming, no `max_tokens` / `reasoning_effort` / `max_output_tokens`, no reasoning items carried across a tool loop. |
+| Prompt templates | `format!` in `runtime.rs` | One string that grew a clause per feature. Not a file that can be diffed and tested on its own. |
+| Task decomposition | — | Not built. The model picks one tool at a time. |
+| Sub-agents | — | Not built. This would turn one loop into an orchestrator. |
+| Learned allowlists | `Approval` in `tools.rs` | "Allow Always" is a `bool` that dies with the process, on purpose. A persisted allowlist needs review and revoke before it exists. |
+| Guardian review | approval prompt on stdin | Blocking, in the loop. No async handoff. |
+| TUI | `src/tui/`, `--tui` | Interactive screen on branch `TUI-UX`. One-shot CLI stays the default. No model-token streaming yet; the live cell is the in-flight tool. |
+| Evaluation | `cargo test` in each module | Unit tests only. No end-to-end harness, no pass@k, latency, or token totals. |
+
+## Next, one at a time
+
+One item per branch, finished and verified before the next starts. Live bugs
+first, then things already half-built, then new capability, then the items
+that change what this project is. Limits, loop bounds, error handling, prompt
+wording and module placement stay the owner's call.
+
+1. **Screening false positives.** Done, in the working tree. `command_concerns`
+   believes an absolute token only with two or more components, or one that
+   exists on disk. A bare `/` is not flagged. The sandbox still refuses
+   `rm -rf /`.
+2. **Loopback in the sandbox.** Done. With remote network denied, the Seatbelt
+   profile still allows bind, inbound and outbound to `localhost` (127.0.0.1
+   and ::1). `--allow-network` still opens the real internet, and that profile
+   does not also carry the denial.
+2b. **Streaming.** Done. Both transports parse SSE and `TurnEvent::Delta`
+   flows through the existing `TurnSink` into the widget; verified against both
+   live wires. Left open: Sarvam streams its reasoning trace as
+   `reasoning_content` deltas, which is why nothing appears for several seconds
+   before an answer - 671 of 675 tokens on a "say hello" turn - and showing it
+   dimmed would fill that wait. There is also no stable/tail split, so a
+   markdown table only lays out once the turn finishes.
+3. **`max_tokens` / `reasoning_effort` / `max_output_tokens`.** The cause of
+   intermittent `finish_reason: length` empty answers. Values and defaults are
+   the owner's call.
+4. **Turn limit.** Make `MAX_TURNS` a flag. The failure names what was done so
+   far, not only that the loop stopped.
+5. **More tools.** `list_files` and `grep`, then `apply_patch`. Each is a
+   `Tool` impl. `apply_patch` inherits `write_file`'s confinement.
+6. **Prompt templates.** Move the system prompt out of the `format!` in
+   `runtime.rs` so it can be read, diffed and tested.
+7. **Context window management.** Token budgeting and priority-based inclusion.
+   The per-tool cap stays.
+8. **Transcript compression.** The only sanctioned mutator of stored history.
+   Depends on 7.
+9. **`anthropic_messages` transport.** A third `ApiMode`. It stays inside
+   `llm/`.
+10. **Named sessions.** `--session <id>`, plus listing and searching. The row
+    exists; cwd is the only lookup today.
+11. **Evaluation harness.** End-to-end scenarios with a scored outcome, then
+    pass@k, latency and token usage.
+12. **Learned allowlists.** Persisted consent, with a way to review and revoke
+    it. "Allow Always" for one run stays as it is.
+13. **Guardian review.** Hand a sensitive operation to a person out of band
+    rather than blocking the loop on stdin.
+14. **Task decomposition.** Break a goal into a tool sequence before acting.
+15. **Sub-agents, and a TUI.** The TUI is in progress on `TUI-UX`. It lives in
+    `src/tui/` and is reached with `--tui`. The one-shot CLI stays the default.
+    The screen is a state machine (composer, footer, transcript, approval)
+    drawn by ratatui; the runtime loop is unchanged and reports progress
+    through `TurnSink`. Model-token streaming is still not in the client, so
+    the live cell is the in-flight tool, not a partial completion. Sub-agents
+    are still not started.
 
 ## Environment note
 

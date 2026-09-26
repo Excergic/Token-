@@ -167,7 +167,7 @@ pub fn command_concerns(command: &str, root: &Path) -> Vec<String> {
             ));
             continue;
         }
-        if path.is_absolute() && !path.starts_with(root) {
+        if path.is_absolute() && !path.starts_with(root) && names_a_real_path(path) {
             note(format!("`{token}` is outside the project"));
             continue;
         }
@@ -179,6 +179,27 @@ pub fn command_concerns(command: &str, root: &Path) -> Vec<String> {
         }
     }
     concerns
+}
+
+/// Whether an absolute token is worth believing as a path.
+///
+/// A shell command is full of things that start with a slash and are not
+/// files. `/` and `/hello` in `for path in ['/', '/hello']` are URL routes,
+/// and warning about them was the first thing a real task produced. Two or
+/// more components reads as a path on its own; a single one is believed only
+/// if it is actually there.
+///
+/// A bare `/` is therefore never flagged. `rm -rf /` loses its warning, which
+/// is a deliberate trade: a lone slash is far more often a string literal, and
+/// what stops that command is the sandbox refusing every write outside the
+/// project, not a word match. The approval prompt still shows the user the
+/// command either way.
+fn names_a_real_path(path: &Path) -> bool {
+    let named = path
+        .components()
+        .filter(|component| matches!(component, Component::Normal(_)))
+        .count();
+    named >= 2 || (named == 1 && path.exists())
 }
 
 /// Split a command into the words that might be paths. Deliberately crude:
@@ -447,8 +468,27 @@ mod tests {
     fn a_command_leaving_the_project_is_flagged() {
         assert!(!concerns("rm /etc/hosts").is_empty());
         assert!(!concerns("rm ../outside.txt").is_empty());
-        assert!(!concerns("rm -rf /").is_empty());
         assert!(!concerns("cp notes.md ~/Desktop").is_empty());
+        // One component, but it is really there.
+        assert!(!concerns("rm -rf /etc").is_empty());
+    }
+
+    #[test]
+    fn url_routes_in_a_string_literal_are_not_paths() {
+        // Seen on the first real task: a python heredoc containing
+        // `for path in ['/', '/hello']` produced two warnings about leaving
+        // the project. Noise here costs every warning its meaning.
+        assert!(concerns("python3 -c \"for p in ['/', '/hello']: print(p)\"").is_empty());
+        assert!(concerns("curl http://127.0.0.1:8000/hello").is_empty());
+        assert!(concerns("echo /nonexistent-route").is_empty());
+    }
+
+    #[test]
+    fn a_bare_slash_is_not_flagged() {
+        // Deliberate: a lone slash is usually a string literal, and the
+        // sandbox is what refuses `rm -rf /`, not this.
+        assert!(concerns("rm -rf /").is_empty());
+        assert!(concerns("df -h /").is_empty());
     }
 
     #[test]
