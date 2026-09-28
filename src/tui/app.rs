@@ -8,7 +8,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::runtime::{
     AgentRuntime, ApprovalChoice, ApprovalRequest, RuntimeError, TurnEvent, TurnSink,
@@ -78,6 +78,9 @@ pub fn launch(
                     }
                     widget.paste(&text);
                 }
+                // A terminal that reports releases would otherwise type every
+                // character twice.
+                Event::Key(key) if key.kind == KeyEventKind::Release => {}
                 Event::Key(key) => {
                     let flush = note_burst(&mut burst, &key);
                     if let Some(ready) = flush {
@@ -233,19 +236,30 @@ fn note_burst(burst: &mut PasteBurst, key: &KeyEvent) -> Option<String> {
     }
 }
 
+/// Option-arrow on macOS arrives as Alt+b / Alt+f in most terminals, and as
+/// Alt+Left / Alt+Right in the rest, so both spellings move by word.
 fn map_key(key: KeyEvent) -> Key {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
     match key.code {
         KeyCode::Char(ch) if ctrl => Key::Ctrl(ch),
-        KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => Key::Char('\n'),
+        KeyCode::Char('b') if alt => Key::WordLeft,
+        KeyCode::Char('f') if alt => Key::WordRight,
+        KeyCode::Enter if alt || key.modifiers.contains(KeyModifiers::SHIFT) => Key::Char('\n'),
         KeyCode::Enter => Key::Enter,
+        KeyCode::Backspace if alt || ctrl => Key::DeleteWord,
         KeyCode::Backspace => Key::Backspace,
+        KeyCode::Delete => Key::Delete,
         KeyCode::Esc => Key::Esc,
         KeyCode::Tab => Key::Tab,
         KeyCode::Up => Key::Up,
         KeyCode::Down => Key::Down,
+        KeyCode::Left if alt || ctrl => Key::WordLeft,
+        KeyCode::Right if alt || ctrl => Key::WordRight,
         KeyCode::Left => Key::Left,
         KeyCode::Right => Key::Right,
+        KeyCode::Home => Key::Home,
+        KeyCode::End => Key::End,
         KeyCode::PageUp => Key::PageUp,
         KeyCode::PageDown => Key::PageDown,
         KeyCode::Char(ch) => Key::Char(ch),

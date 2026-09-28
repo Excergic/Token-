@@ -27,9 +27,21 @@ pub fn pet_frame(phase: usize) -> &'static str {
     FRAMES[phase % FRAMES.len()]
 }
 
+/// A braille spinner for work in flight.
+pub fn spinner(phase: usize) -> &'static str {
+    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    FRAMES[phase % FRAMES.len()]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_spinner_cycles() {
+        assert_eq!(spinner(0), spinner(10));
+        assert_ne!(spinner(0), spinner(1));
+    }
 
     #[test]
     fn the_bold_cell_walks_and_wraps() {
