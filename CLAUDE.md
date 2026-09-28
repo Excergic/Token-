@@ -46,6 +46,14 @@ tools.rs       Tool trait, Registry, handlers; know nothing about conversations
 policy.rs      what the agent may never read or write; no I/O, pure decisions
 secrets.rs     redaction for secrets policy.rs had no chance to refuse
 sandbox.rs     OS-enforced confinement; the ONLY module that knows Seatbelt
+tui/app.rs     event loop; owns the terminal and the runtime's thread
+tui/chatwidget.rs  screen state machine: keys, overlays, layout, drawing
+tui/composer.rs    the draft: editing, history, search, kill buffer, pastes
+tui/render.rs  styled rows: markdown, code frames, tables, diffs, wrapping
+tui/markdown.rs    block and inline markdown parsing; no colours
+tui/highlight.rs   code lexer to token kinds; no colours
+tui/styles.rs  palette per theme and colour depth, brand gradient
+tui/footer.rs, shimmer.rs, diff_render.rs, history.rs  small pure helpers
 ```
 
 Do not collapse these. The runtime owns conversation state deliberately, so the
@@ -80,7 +88,7 @@ transcript can be inspected, truncated or replayed later.
 - **Tool specs are provider-neutral.** `Tool::spec()` returns a `ToolSpec`;
   each transport renders it (chat nests under `function`, Responses is flat).
   `tools.rs` must not learn any provider's JSON shape.
-- **Sessions are write-through.** The runtime records each message before it
+-                                                   **Sessions are write-through.** The runtime records each message before it
   reaches the `Conversation`, so there is no exit path that can lose a turn and
   no flush to forget. A failed write stops the run rather than continuing
   against a transcript that will not come back.
@@ -91,7 +99,6 @@ transcript can be inspected, truncated or replayed later.
   keeps its stored system prompt verbatim: rebuilding it would change the
   prompt under a conversation already held with the old one.
 - **Nothing is written without the user's approval.** `Tool::mutates` marks a
-  tool as changing the filesystem; the registry asks before dispatching one and
   never asks for anything else. `approve` is a parameter, so `tools.rs` stays
   free of terminal I/O and a test can answer for itself. Silence is a no: a
   closed stdin, an unanswered prompt, a read error and an answer that is not
@@ -214,6 +221,24 @@ transcript can be inspected, truncated or replayed later.
   answer. The TUI renders streamed text plain and lets the finished cell do the
   markdown: re-laying out on every delta reflows tables and code blocks as they
   grow, which reads worse than waiting.
+- **Parsing, highlighting and colour are separate.** `markdown.rs` and
+  `highlight.rs` return kinds (`Inline::Strong`, `Tok::Keyword`), never
+  colours; `render.rs` maps kinds to palette roles; `styles.rs` is the only
+  place a colour value is chosen. Each is tested without a terminal. The
+  highlighter is a lexer per language family, not a grammar: a wrong guess
+  costs a colour, never a character, and a test pins that nothing is dropped.
+- **Wrapping keeps every span's style.** `render::wrap_spans` breaks on
+  display width (`unicode-width`), not bytes or chars, and a `Row` carries a
+  first-line and continuation prefix so bullets, quotes and code gutters hang
+  correctly. Flattening a line to one style before wrapping is what used to
+  make bold impossible.
+- **Colour degrades by depth, not by accident.** Truecolor gets RGB, 256
+  gets the nearest xterm index, 16 gets names and no backgrounds at all
+  (a 16-colour "pastel" is a solid block). Badges fall back to bold colour.
+- **The composer wraps and draws its own caret.** A draft that did not wrap
+  ran off the box and made editing keys look ignored. The caret is a
+  reversed cell that blinks, solid for 500 ms after a key, because the
+  terminal's own blink is off by default on macOS.
 - **Null is not absence on this wire either.** Sarvam sends `"content": null`
   and `"tool_calls": null` in most chunks, and closes with a usage-only chunk
   whose `choices` is empty, then `[DONE]`. `Option` fields handle that; a
@@ -266,7 +291,7 @@ The paths below are this crate's modules. A Codex-shaped tree (`core/src/`,
 | Sub-agents | — | Not built. This would turn one loop into an orchestrator. |
 | Learned allowlists | `Approval` in `tools.rs` | "Allow Always" is a `bool` that dies with the process, on purpose. A persisted allowlist needs review and revoke before it exists. |
 | Guardian review | approval prompt on stdin | Blocking, in the loop. No async handoff. |
-| TUI | `src/tui/`, `--tui` | Interactive screen on branch `TUI-UX`. One-shot CLI stays the default. No model-token streaming yet; the live cell is the in-flight tool. |
+| TUI | `src/tui/`, `--tui` | Interactive screen. One-shot CLI stays the default. Styled markdown, syntax-highlighted code frames, boxed tables, gradient header and composer, blinking caret, word-level editing keys (branch `tui-design`). Streamed text is plain until the turn finishes. |
 | Evaluation | `cargo test` in each module | Unit tests only. No end-to-end harness, no pass@k, latency, or token totals. |
 
 ## Next, one at a time

@@ -124,12 +124,84 @@ impl Composer {
         self.insert_plain(&killed);
     }
 
+    /// The Delete key: the character after the caret.
+    pub fn delete_forward(&mut self) {
+        if self.cursor >= self.text.len() {
+            return;
+        }
+        let end = next_boundary(&self.text, self.cursor);
+        self.text.replace_range(self.cursor..end, "");
+    }
+
+    /// Ctrl+W and Alt+Backspace: back to the start of the previous word.
+    pub fn delete_word_back(&mut self) {
+        let start = word_start(&self.text, self.cursor);
+        self.text.replace_range(start..self.cursor, "");
+        self.cursor = start;
+    }
+
+    /// Ctrl+U. Like Ctrl+K, what it removes can be yanked back.
+    pub fn kill_to_start(&mut self) {
+        let start = line_start(&self.text, self.cursor);
+        self.kill = self.text[start..self.cursor].to_string();
+        self.text.replace_range(start..self.cursor, "");
+        self.cursor = start;
+    }
+
     pub fn move_left(&mut self) {
         self.cursor = prev_boundary(&self.text, self.cursor);
     }
 
     pub fn move_right(&mut self) {
         self.cursor = next_boundary(&self.text, self.cursor);
+    }
+
+    pub fn move_home(&mut self) {
+        self.cursor = line_start(&self.text, self.cursor);
+    }
+
+    pub fn move_end(&mut self) {
+        self.cursor = line_end(&self.text, self.cursor);
+    }
+
+    pub fn move_word_left(&mut self) {
+        self.cursor = word_start(&self.text, self.cursor);
+    }
+
+    pub fn move_word_right(&mut self) {
+        let rest = &self.text[self.cursor..];
+        let skip_space = rest.len() - rest.trim_start().len();
+        let word = rest[skip_space..]
+            .find(char::is_whitespace)
+            .unwrap_or(rest.len() - skip_space);
+        self.cursor += skip_space + word;
+    }
+
+    /// Up inside a multi-line draft. False on the first line, so the caller
+    /// can fall through to history.
+    pub fn move_up(&mut self) -> bool {
+        let start = line_start(&self.text, self.cursor);
+        if start == 0 {
+            return false;
+        }
+        let column = self.text[start..self.cursor].chars().count();
+        let above = line_start(&self.text, start - 1);
+        self.cursor = column_offset(&self.text, above, start - 1, column);
+        true
+    }
+
+    /// Down inside a multi-line draft. False on the last line.
+    pub fn move_down(&mut self) -> bool {
+        let end = line_end(&self.text, self.cursor);
+        if end >= self.text.len() {
+            return false;
+        }
+        let column = self.text[line_start(&self.text, self.cursor)..self.cursor]
+            .chars()
+            .count();
+        let below = end + 1;
+        self.cursor = column_offset(&self.text, below, line_end(&self.text, below), column);
+        true
     }
 
     pub fn history_prev(&mut self) {
@@ -326,6 +398,29 @@ fn line_end(text: &str, cursor: usize) -> usize {
         .unwrap_or(text.len())
 }
 
+fn line_start(text: &str, cursor: usize) -> usize {
+    text[..cursor].rfind('\n').map(|at| at + 1).unwrap_or(0)
+}
+
+/// Skip spaces backwards, then the word before them.
+fn word_start(text: &str, cursor: usize) -> usize {
+    let before = &text[..cursor];
+    let trimmed = before.trim_end();
+    trimmed
+        .rfind(char::is_whitespace)
+        .map(|at| at + trimmed[at..].chars().next().map_or(1, char::len_utf8))
+        .unwrap_or(0)
+}
+
+/// The byte offset `column` characters into the line `start..end`, or its end.
+fn column_offset(text: &str, start: usize, end: usize, column: usize) -> usize {
+    text[start..end]
+        .char_indices()
+        .nth(column)
+        .map(|(at, _)| start + at)
+        .unwrap_or(end)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,6 +485,63 @@ mod tests {
         composer.search_accept();
         assert_eq!(composer.text(), "cargo build");
         assert!(composer.searching().is_none());
+    }
+
+    #[test]
+    fn backspace_and_delete_work_mid_line() {
+        let mut composer = Composer::default();
+        composer.insert_paste("héllo");
+        composer.move_left();
+        composer.move_left();
+        composer.backspace();
+        assert_eq!(composer.text(), "hélo");
+        composer.delete_forward();
+        assert_eq!(composer.text(), "héo");
+        composer.move_home();
+        composer.delete_forward();
+        assert_eq!(composer.text(), "éo");
+        composer.move_end();
+        composer.delete_forward();
+        assert_eq!(composer.text(), "éo");
+    }
+
+    #[test]
+    fn words_are_jumped_and_deleted() {
+        let mut composer = Composer::default();
+        composer.insert_paste("run the tests  ");
+        composer.delete_word_back();
+        assert_eq!(composer.text(), "run the ");
+        composer.move_word_left();
+        assert_eq!(composer.cursor(), 4);
+        composer.move_word_left();
+        assert_eq!(composer.cursor(), 0);
+        composer.move_word_right();
+        assert_eq!(composer.cursor(), 3);
+    }
+
+    #[test]
+    fn kill_to_start_can_be_yanked_back() {
+        let mut composer = Composer::default();
+        composer.insert_paste("abc def");
+        composer.move_left();
+        composer.move_left();
+        composer.kill_to_start();
+        assert_eq!(composer.text(), "ef");
+        composer.move_end();
+        composer.yank();
+        assert_eq!(composer.text(), "efabc d");
+    }
+
+    #[test]
+    fn up_and_down_move_between_lines_before_history() {
+        let mut composer = Composer::default();
+        composer.insert_paste("first line\nsecond");
+        assert!(composer.move_up());
+        assert_eq!(composer.cursor(), 6);
+        assert!(!composer.move_up());
+        assert!(composer.move_down());
+        assert_eq!(composer.cursor(), composer.text().len());
+        assert!(!composer.move_down());
     }
 
     #[test]
